@@ -224,7 +224,7 @@ tqdm
 opencv-python
 pillow
 nltk
-editdistance
+rapidfuzz
 albumentations
 optuna
 tensorboard
@@ -236,8 +236,10 @@ google-generativeai
 jupyter
 ipykernel
 pdf2image
-h5py                    # для кэша датасета (опционально)
+h5py
 ```
+
+> `rapidfuzz` вместо `editdistance` — editdistance требует C-компилятор (MSVC), не собирается на Windows без него. rapidfuzz имеет prebuilt wheels, быстрее, и предоставляет те же операции Левенштейна.
 
 ---
 
@@ -1115,52 +1117,56 @@ streamlit run frontend.py
 
 ## Итоговый порядок выполнения
 
+### Часть 1 — Конфигурация и структура проекта
 ```
-Шаг 0    → config.py (центральная конфигурация + GPU-профили + tuning guide)
-Шаг 1    → Структура проекта + requirements.txt
-Шаг 2a   → Скачать im2latex-100k
-Шаг 3    → data/tokenizer.py (обновить: кириллица + пробел)
-Шаг 2b   → generate_synthetic.py + data/synthetic.py (синтетический датасет)
-Шаг 1.5  → prepare_data.py (предподготовка датасета — кэш)
-Шаг 4    → data/preprocess.py (обновить: elastic per-dataset, curriculum)
-Шаг 5    → data/dataset.py (читать из кэша, stage 3 с replay)
-Шаг 11.5 → utils/schedules.py (curriculum-расписания)
-Шаг 6    → model/encoder.py (CNN Backbone + ViT)
-Шаг 7    → model/decoder.py (FlashAttention Decoder + RoPE)
-Шаг 8    → model/model.py (Notes2LaTeX)
-Шаг 9    → utils/metrics.py (+ CER, Edit Distance)
-Шаг 10   → utils/beam_search.py
-Шаг 11   → utils/visualization.py
-Шаг 16   → tune.py (Optuna Search — подобрать гиперпараметры)
-Шаг 12   → train.py (3-стадийное обучение: pretrain → mixed)
-Шаг 13   → evaluate.py
-            ↕ параллельно
-Шаг 14   → labeling/ (сбор своего датасета) + prepare_data --datasets handwritten
-            ↓ после шагов 13 + 14
-Шаг 15   → finetune.py (handwritten + replay synthetic)
-Шаг 17   → app.py + frontend.py (FastAPI + Streamlit)
-Шаг 18   → Оформление
+Шаг 0    → config.py                         ✅ готово
+Шаг 1    → структура проекта + requirements  ✅ готово
+Шаг 2a   → скачать im2latex-100k             (ручная загрузка)
 ```
 
-### Критический путь
-
+### Часть 2 — Пайплайн данных
 ```
-config.py → tokenizer → prepare_data.py → dataset → model → train.py
+Шаг 3    → data/tokenizer.py                 ✅ готово
+Шаг 4    → data/preprocess.py               (elastic per-dataset, curriculum)
+Шаг 11.5 → utils/schedules.py               (curriculum-расписания)
+Шаг 5    → data/dataset.py                  (кэш, 3 стадии, replay buffer)
+Шаг 1.5  → prepare_data.py                  (кэш .npy — запуск перед обучением)
+Шаг 2b   → generate_synthetic.py            (генерация синтетики для Stage 2)
 ```
 
-Это минимум для первого запуска обучения.
-Синтетический датасет и labeling развиваются параллельно.
-
-### Зависимости между шагами
-
+### Часть 3 — Модель
 ```
-Шаг 0 (config)   ─────────────────────────────────────→ нужен везде
-Шаг 2a (im2latex) ──→ Шаг 3 (tokenizer)
-Шаг 2b (synthetic) ──→ Шаг 3 (tokenizer)
-Шаг 3 (tokenizer) ──→ Шаг 1.5 (prepare_data) ──→ Шаг 5 (dataset)
-Шаг 4 (preprocess) + Шаг 11.5 (schedules) ──→ Шаг 5 (dataset)
-Шаг 6 (encoder) + Шаг 7 (decoder + RoPE) ──→ Шаг 8 (model) ──→ Шаг 12 (train)
-Шаг 14 (labeling) ──→ prepare_data --datasets handwritten ──→ Шаг 15 (finetune)
-Шаг 12 (train) ──→ Шаг 13 (evaluate) ──→ Шаг 15 (finetune)
-Шаг 15 (finetune) ──→ Шаг 17 (app)
+Шаг 7    → model/rope.py                    (Rotary Position Embeddings)
+Шаг 6    → model/encoder.py                 (CNN Backbone + Transformer Encoder)
+Шаг 7    → model/decoder.py                 (Decoder + RoPE self-attention)
+Шаг 8    → model/model.py                   (Notes2LaTeX — encoder + decoder)
+```
+
+### Часть 4 — Утилиты обучения
+```
+Шаг 9    → utils/metrics.py                 (BLEU, CER, ExactMatch, EditDistance)
+Шаг 10   → utils/beam_search.py             (beam search декодирование)
+Шаг 11   → utils/visualization.py           (графики, примеры предсказаний)
+```
+
+### Часть 5 — Обучение
+```
+Шаг 16   → tune.py                          (Optuna: подбор гиперпараметров)
+Шаг 12   → train.py                         (Stage 1: pretrain, Stage 2: mixed)
+Шаг 13   → evaluate.py                      (оценка на тестовой выборке)
+```
+
+### Часть 6 — Собственный датасет и дообучение
+```
+Шаг 14a  → labeling/slicer.py              (нарезка страниц на строки)
+Шаг 14b  → labeling/auto_label.py          (авторазметка через Gemini API)
+Шаг 14c  → labeling/label_tool.py          (GUI верификации разметки)
+           → prepare_data.py --datasets handwritten
+Шаг 15   → finetune.py                      (Stage 3: handwritten + replay)
+```
+
+### Часть 7 — Приложение и оформление
+```
+Шаг 17   → app.py + frontend.py            (FastAPI + Streamlit)
+Шаг 18   → README.md + графики + примеры
 ```
