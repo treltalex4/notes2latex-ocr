@@ -8,20 +8,16 @@ Pipeline:
     4. Resize до фиксированного размера с сохранением пропорций (pad белым цветом)
     5. Нормализация в тензор PyTorch
 
-Выходной формат: torch.Tensor shape [1, H, W] (по умолчанию [1, 64, 512]).
+Выходной формат: torch.Tensor shape [1, H, W].
+target_h и max_w берутся из config.target_height / config.max_width.
 """
-import os
-
 import cv2
 import numpy as np
 import torch
 import random
 
 
-# --- Константы по умолчанию ---
-TARGET_HEIGHT = 128
-TARGET_WIDTH = 1024  # Максимальный лимит, а не фиксированный размер
-PAD_VALUE = 255  # Считаем белый за фон
+PAD_VALUE = 255  # белый фон — не зависит от железа
 
 
 def load_image(image_path: str) -> np.ndarray | None:
@@ -75,8 +71,8 @@ def binarize(img: np.ndarray) -> np.ndarray:
 
 def resize_preserve_aspect(
     img: np.ndarray,
-    target_h: int = TARGET_HEIGHT,
-    max_w: int = TARGET_WIDTH,
+    target_h: int,
+    max_w: int,
 ) -> np.ndarray:
     h, w = img.shape
 
@@ -133,8 +129,8 @@ def to_tensor(img: np.ndarray) -> torch.Tensor:
 
 def preprocess_image(
     image_path: str,
-    target_h: int = TARGET_HEIGHT,
-    max_w: int = TARGET_WIDTH,
+    target_h: int,
+    max_w: int,
     augment: bool = False,
 ) -> torch.Tensor | None:
     """Полный пайплайн: загрузка -> обрезка -> [аугментация] -> бинаризация -> ресайз -> тензор."""
