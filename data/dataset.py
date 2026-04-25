@@ -1,13 +1,3 @@
-"""
-Im2LatexDataset — PyTorch Dataset для датасета im2latex-100k.
-
-Включает:
-1. Чтение .lst файлов и фильтрацию поврежденных данных.
-2. Использование BucketBatchSampler: группировка формул схожей длины в батчи.
-3. Динамический CollateFunction: паддинг картинок и формул только до
-   максимума *внутри текущего батча* (радикальная экономия VRAM).
-"""
-
 import os
 import random
 
@@ -28,13 +18,6 @@ class Im2LatexDataset(Dataset):
         target_h: int = 128,
         target_w: int = 1024,
     ):
-        """
-        Args:
-            data_dir:   путь к папке data_raw/ с файлами датасета.
-            split:      "train", "validate" или "test".
-            target_h:   целевая высота изображения (по умолчанию 128 для CNN).
-            target_w:   максимальная разрешенная ширина изображения (сжатие, если больше).
-        """
         self.data_dir = data_dir
         self.target_h = target_h
         self.target_w = target_w

@@ -1,9 +1,3 @@
-"""
-Работа с кэшем предобработанных изображений (data_cache/).
-
-"""
-
-
 def load_manifest(cache_dir: str, dataset_name: str) -> list[dict]:
     raise NotImplementedError
 
