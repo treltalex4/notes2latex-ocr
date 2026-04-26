@@ -1,2 +1,4 @@
+#start
+
 class LaTeXDecoder:
     pass
