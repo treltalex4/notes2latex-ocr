@@ -115,7 +115,7 @@ def test_dataloader(data_dir: str, tok: LaTeXTokenizer):
     print("\n=== 4. DataLoader ===")
     config = load_config()
 
-    from data.dataset import Im2LatexDataset, build_dataloaders
+    from data.dataset import RawIm2LatexDataset, build_dataloaders
 
     # Считаем число батчей через даталоадер
     train_loader, _, _ = build_dataloaders(
@@ -129,7 +129,7 @@ def test_dataloader(data_dir: str, tok: LaTeXTokenizer):
 
     # Для сохранения sample-изображений идём по датасету напрямую —
     # только так можно получить имя исходного файла
-    dataset = Im2LatexDataset(
+    dataset = RawIm2LatexDataset(
         data_dir, split="train",
         target_h=config.target_height,
         target_w=config.max_width,
