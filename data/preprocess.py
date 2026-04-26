@@ -37,11 +37,16 @@ def binarize(img: np.ndarray) -> np.ndarray:
     if len(np.unique(img)) <= 2:
         return img
 
+    # blockSize scales with image height so the neighborhood covers ~1/6 of height;
+    # must be odd and at least 11
+    h = img.shape[0]
+    block_size = max(11, (h // 6) | 1)
+
     binary = cv2.adaptiveThreshold(
         img, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        blockSize=11,
+        blockSize=block_size,
         C=5,
     )
     return cv2.medianBlur(binary, 3)
@@ -64,11 +69,16 @@ def apply_augmentations(
     elastic_sigma: int,
     strength: float,    # 0..1, линейно нарастает по эпохам
 ) -> np.ndarray:
-    # ElasticTransform — только на im2latex и synthetic (не на handwritten)
+    # ElasticTransform — только на im2latex и synthetic (не на handwritten).
+    # alpha масштабируется по высоте изображения чтобы сдвиг был одинаковым
+    # независимо от того, маленькая формула или большая.
     if elastic_p > 0 and dataset_type != "handwritten":
+        h = img.shape[0]
+        scaled_alpha = float(elastic_alpha) * h / 128.0
+        scaled_sigma = float(elastic_sigma) * h / 128.0
         img = A.ElasticTransform(
-            alpha=float(elastic_alpha),
-            sigma=float(elastic_sigma),
+            alpha=scaled_alpha,
+            sigma=scaled_sigma,
             p=elastic_p,
         )(image=img)["image"]
 
@@ -136,12 +146,12 @@ def preprocess_image(
         return None
 
     img = crop_to_content(img)
+    img = resize_preserve_aspect(img, target_h, max_w)
+    img = binarize(img)
 
     if augment:
         img = apply_augmentations(
             img, dataset_type, elastic_p, elastic_alpha, elastic_sigma, strength
         )
 
-    img = resize_preserve_aspect(img, target_h, max_w)
-    img = binarize(img)
     return to_tensor(img)
