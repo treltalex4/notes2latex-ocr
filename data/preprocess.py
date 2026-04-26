@@ -146,6 +146,8 @@ def preprocess_image(
         return None
 
     img = crop_to_content(img)
+    # resize before binarize: adaptive blockSize is calibrated for target_height pixels;
+    # binarizing a tiny source image then upscaling amplifies threshold artifacts.
     img = resize_preserve_aspect(img, target_h, max_w)
     img = binarize(img)
 

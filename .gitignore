@@ -17,6 +17,8 @@ data_raw/
 my_dataset/
 checkpoints/
 notebooks/data/
+data_synthetic/
+data_cache/
 
 # Local testing and development
 test/

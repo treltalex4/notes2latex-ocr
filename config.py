@@ -54,10 +54,21 @@ class Config:
 
     # ===== Dataset Quality =====
     # (см. Manual Tuning Guide в implementation_plan.md)
-    synthetic_count: int = 40_000           # объём синтетики
+    synthetic_count: int = 40_000           # целевое число изображений
     latex_templates_count: int = 500        # кол-во уникальных LaTeX-шаблонов
-    synthetic_fonts_count: int = 4          # вариаций шрифтов при рендере
-    synthetic_long_ratio: float = 0.15      # доля длинных (>400 токенов) примеров
+    synthetic_fonts_count: int = 4          # сколько шрифтов выбрать из доступных
+    synthetic_font_sizes: list = field(default_factory=lambda: [10, 11, 12, 14])  # pt
+
+    # Шаблоны выбираются равновероятно из общего пула (80 шт.).
+    # Естественное распределение: text≈25%, formula≈36%, mixed≈29%, long≈22%.
+    # synthetic_template_weights — опциональные веса по категориям (None = равномерно)
+    synthetic_template_weights: dict = field(
+        default_factory=lambda: {"text": 1.0, "formula": 1.0, "mixed": 1.0, "long": 1.0}
+    )
+
+    synthetic_dpi: int = 200                # разрешение рендера (DPI)
+    synthetic_min_chars: int = 8            # пропускать контент короче N символов
+    synthetic_max_attempts_ratio: int = 6   # max попыток рендера = count × коэффициент
 
     # ===== Augmentations =====
     use_elastic_im2latex: bool = True       # mild elastic на im2latex
@@ -97,6 +108,65 @@ class Config:
     beam_max_len: int = 600         # 2× от тренировочного max — запас на длинные строки
     length_penalty: float = 0.7
 
+    # ===== Slicing (labeling/slicer.py) =====
+    slice_max_width: int = 2500
+    slice_deskew: bool = True
+
+    slice_detect_dark_threshold: int = 75    # строгая маска: основа сегментации строк
+    slice_expand_dark_threshold: int = 130   # мягкая маска: для захвата сирот
+    slice_border_margin_px: int = 4
+
+    slice_min_line_height: int = 20
+    slice_min_line_width: int = 60
+
+    slice_rlsa_h_kernel_factor: float = 6.0   # горизонтальное CLOSE = factor × median_h
+    slice_rlsa_v_kernel_factor: float = 0.2   # малое вертикальное CLOSE для под/надстрочных
+    slice_min_cc_area_for_scale: int = 25     # игнорировать шумовые CC при оценке масштаба
+
+    slice_orphan_v_distance_factor: float = 1.5  # × median_h
+    slice_orphan_h_tolerance_px: int = 28
+    slice_orphan_min_area: int = 3
+    slice_orphan_max_height_factor: float = 2.0   # не захватывать крупные CC (своя строка)
+
+    slice_split_height_factor: float = 3.0     # × median_h; ниже — не делить
+    slice_split_valley_ratio: float = 0.08     # долина < ratio × пик в профиле строки
+    slice_split_min_run_factor: float = 0.30   # мин. длина долины × median_h
+
+    slice_merge_y_overlap_ratio: float = 0.30
+
+    slice_edge_touch_ratio: float = 0.012
+    slice_edge_expand_x: int = 14
+    slice_edge_expand_y: int = 10
+    slice_max_edge_expand_iters: int = 3
+
+    slice_pad_x: int = 16
+    slice_pad_y: int = 14
+
+    # ── Perspective correction ────────────────────────────────────────────
+    slice_perspective_correction: bool = False  # отключено: ломает ровные фото
+    slice_perspective_min_lines: int = 6
+
+    # ── Per-line deskew (OBB) ─────────────────────────────────────────────
+    slice_per_line_deskew: bool = True
+    slice_per_line_deskew_min_angle: float = 0.5
+
+    # ── Baseline estimation for orphan assignment ─────────────────────────
+    slice_use_baseline_assignment: bool = True
+    slice_baseline_bin_width: int = 25
+
+    # ── Garbage filtering ─────────────────────────────────────────────────
+    slice_min_ink_density: float = 0.015
+    slice_min_ink_components: int = 3
+    slice_min_crop_width_ratio: float = 0.04
+    slice_min_crop_aspect_ratio: float = 0.3
+
+    # ── Contour masking ───────────────────────────────────────────────────
+    slice_contour_mask_lines: bool = True
+    slice_contour_mask_dilate: int = 3
+
+    # ── Directed RLSA ─────────────────────────────────────────────────────
+    slice_directed_rlsa: bool = True
+
     # ===== Paths =====
     data_dir: str = "data_raw"
     synthetic_dir: str = "data_synthetic"
@@ -131,7 +201,8 @@ _PROFILES: dict[str, dict[str, Any]] = {
         "synthetic_count": 150_000,
         "latex_templates_count": 2000,
         "synthetic_fonts_count": 10,
-        "synthetic_long_ratio": 0.20,
+        "synthetic_font_sizes": [10, 11, 12, 14, 16],  # добавляем 16pt для крупных формул
+        "synthetic_dpi": 250,                           # выше DPI — чётче мелкие индексы
         "augment_strength_max": 1.0,
     },
 }
