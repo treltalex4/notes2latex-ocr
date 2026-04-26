@@ -23,3 +23,8 @@ data_cache/
 # Local testing and development
 test/
 notebooks/
+runs/
+
+# YOLO Weights
+yolo26m.pt
+yolo26n.pt
