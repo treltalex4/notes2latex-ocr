@@ -983,39 +983,228 @@ torch.save({
 
 ### 14a — Нарезка строк (`labeling/slicer.py`)
 
-Функция `slice_page_into_lines(image_path, output_dir)`:
+Цель: из фото/скана страницы получить аккуратные кропы отдельных строк,
+готовые к авторазметке и верификации.
 
-1. Загрузить фото страницы и применить бинаризацию
-2. Компенсация наклона текста (Deskewing) — через Hough Transform или
-   минимизацию дисперсии проекции
-3. Поиск строк (горизонтальная проекция + Connected Components
-   для обработки наслоений)
-4. Передача предложенных линий разреза в GUI для быстрой проверки
-5. Вырезать и сохранить строки в `my_dataset/images/`
+#### 14a.1 Вход/выход
+
+- Вход:
+  - файл страницы (`.jpg/.png`) или папка со страницами
+  - опционально: JSON с уже подтверждёнными линиями разреза
+- Выход:
+  - изображения строк в `my_dataset/images/`
+  - метаданные в `my_dataset/slices_meta.jsonl`
+  - отладочные превью в `my_dataset/debug_slices/`
+
+Рекомендуемый формат записи одной строки метаданных (JSONL):
+
+```json
+{"line_id":"page_0003_line_05","page":"page_0003.jpg","bbox":[x1,y1,x2,y2],"angle":-1.7,"quality":"ok"}
+```
+
+#### 14a.2 Pipeline нарезки
+
+1. Нормализация входа
+    - привести к grayscale;
+    - ограничить максимальную ширину (например, 2200 px) для стабильного времени обработки;
+    - применить мягкое подавление шума (median blur 3x3).
+2. Бинаризация
+    - использовать adaptive threshold (или Otsu как fallback);
+    - инвертировать при необходимости, чтобы текст был foreground.
+3. Deskew (компенсация наклона)
+    - оценить угол через Hough lines или профиль проекций;
+    - если |angle| > порога (например, 0.3 градуса), повернуть страницу;
+    - сохранить угол в метаданные.
+4. Детекция кандидатов строк
+    - горизонтальная проекция (sum по оси X/Y);
+    - найти полосы с контентом;
+    - объединить близкие полосы (merge gaps), чтобы не дробить одну строку.
+5. Уточнение границ через Connected Components
+    - удалить очень маленькие компоненты (пыль/шум);
+    - расширить bbox по вертикали на 2-6 px, чтобы не срезать индексы/диакритику.
+6. Постобработка кандидатов
+    - отфильтровать слишком узкие/пустые кропы;
+    - задать минимальный размер строки (например, h >= 20, w >= 80);
+    - присвоить `line_id` и порядок.
+7. Предпросмотр и ручная корректировка
+    - сгенерировать overlay-изображение с линиями разреза;
+    - дать оператору быстро принять/подправить разрезы перед финальным сохранением.
+8. Сохранение
+    - кропы: `my_dataset/images/page_XXXX_line_YY.png`;
+    - метаданные: `slices_meta.jsonl`.
+
+#### 14a.3 CLI-режим
+
+```bash
+python -m labeling.slicer --input my_dataset/pages --output my_dataset/images --meta my_dataset/slices_meta.jsonl --save-debug
+```
+
+Рекомендуемые аргументы:
+- `--input` путь к файлу или папке страниц
+- `--output` путь для кропов строк
+- `--meta` путь к JSONL метаданным
+- `--min-line-height`, `--min-line-width`
+- `--deskew on|off`
+- `--save-debug`
+
+#### 14a.4 Критерии качества для 14a
+
+- На 30 случайных страницах:
+  - не более 2-3% строк потеряно;
+  - не более 3-5% строк имеют сильный обрез (символы срезаны);
+  - порядок строк корректен сверху вниз.
+- В `debug_slices` визуально видно, что bbox покрывают весь контент.
 
 ### 14b — Авторазметка (`labeling/auto_label.py`)
 
-1. Взять все PNG из `my_dataset/images/`
-2. Для каждого — отправить в Gemini API с промптом:
-   *«Распознай рукописный текст и формулы. Верни LaTeX-код.
-   Русский текст оберни в \text{...}. Формулы — в $...$. ...»*
-3. Сохранить в `my_dataset/labels_draft.json`
-4. Graceful shutdown (Ctrl+C) — прогресс не теряется
+Цель: автоматически получить черновую LaTeX-разметку для всех нарезанных
+строк, минимизируя ручной ввод в этапе верификации.
+
+#### 14b.1 Источники и провайдеры
+
+- Поддержать провайдеры через единый интерфейс:
+  - Gemini API
+  - LM Studio (локальная VLM через HTTP)
+  - другие API с совместимой схемой запроса
+- Выбор провайдера через CLI (`--provider gemini|lmstudio|custom`).
+
+#### 14b.2 Структура черновой разметки
+
+`my_dataset/labels_draft.json` (словарь по имени файла):
+
+```json
+{
+  "page_0003_line_05.png": {
+     "latex": "\\text{Пусть } f(x)=x^2 \\text{, тогда } f'(x)=2x",
+     "provider": "gemini",
+     "model": "gemini-2.0-flash",
+     "confidence": 0.82,
+     "status": "draft",
+     "updated_at": "2026-04-26T12:10:00Z"
+  }
+}
+```
+
+Если провайдер не отдаёт confidence, сохранять `null`.
+
+#### 14b.3 Промпт и правила нормализации
+
+Базовые правила ответа модели:
+- вернуть только LaTeX-строку без пояснений;
+- русский текст оборачивать в `\\text{...}`;
+- формулы в inline-нотации (`$...$`) только если это требуется форматом датасета,
+  иначе хранить единый plain LaTeX-стиль;
+- не добавлять несуществующий контент.
+
+Постобработка ответа:
+1. trim пробелы и управляющие символы;
+2. нормализовать повторяющиеся пробелы;
+3. проверить баланс скобок `{}` и парность `$`;
+4. при критической поломке синтаксиса пометить `status=needs_review`.
+
+#### 14b.4 Надёжность и продолжение после прерываний
+
+- Обязательно вести `my_dataset/auto_label_progress.json`:
+  - список завершённых файлов;
+  - счётчики ошибок/ретраев;
+  - текущий offset.
+- После каждого успешно обработанного файла делать атомарное сохранение
+  прогресса и черновых меток (write temp + rename).
+- Ретраи на сетевых ошибках: экспоненциальный backoff (например, 1s, 2s, 4s, 8s, max 5 попыток).
+- Graceful shutdown по Ctrl+C:
+  - завершить текущий файл;
+  - сохранить прогресс;
+  - выйти без потери уже сделанной работы.
+
+#### 14b.5 CLI-режим
+
+```bash
+python -m labeling.auto_label --images my_dataset/images --output my_dataset/labels_draft.json --provider gemini --batch-size 1 --max-retries 5
+```
+
+Рекомендуемые аргументы:
+- `--images`, `--output`, `--provider`
+- `--api-key` или чтение из переменной окружения
+- `--resume` (по умолчанию true)
+- `--limit` для тестового прогона
+- `--rate-limit-rps`
+
+#### 14b.6 Минимальные проверки 14b
+
+- Черновик покрывает >= 95% файлов из `my_dataset/images/`.
+- Для 50 случайных строк:
+  - нет пустых ответов;
+  - >= 90% ответов синтаксически парсятся как LaTeX-строки без грубых артефактов.
 
 ### 14c — GUI верификации (`labeling/label_tool.py`)
 
-Tkinter-приложение:
+Цель: быстро и безопасно превратить черновую разметку в финальную gold-разметку
+без потери прогресса.
 
-- Показывает изображение строки
-- Показывает предложенный LaTeX (можно редактировать)
-- Живой рендер формулы (matplotlib) для визуальной проверки
-- Кнопки: Сохранить (Enter), Пропустить (Space), Назад
-- Сохраняет итог в `my_dataset/labels.json`
-- Запоминает прогресс
+#### 14c.1 UX-минимум (обязательные элементы)
+
+- Панель изображения текущей строки
+- Редактор LaTeX (multiline textbox)
+- Превью рендера (matplotlib)
+- Статус-бар: `index / total`, имя файла, статус (draft/verified/skipped)
+- Панель быстрых действий (горячие клавиши)
+
+Горячие клавиши:
+- `Enter` сохранить и перейти дальше
+- `Space` пропустить
+- `Ctrl+S` сохранить без перехода
+- `Backspace`/`Left` назад
+- `Ctrl+R` перерендер
+
+#### 14c.2 Формат финальных меток
+
+`my_dataset/labels.json`:
+
+```json
+{
+  "page_0003_line_05.png": {
+     "latex": "\\text{Пусть } f(x)=x^2 \\text{, тогда } f'(x)=2x",
+     "status": "verified",
+     "source": "draft+human",
+     "reviewed_at": "2026-04-26T13:20:00Z"
+  }
+}
+```
+
+Отдельно вести файл состояния GUI: `my_dataset/label_tool_state.json`
+(последний индекс, фильтр, zoom).
+
+#### 14c.3 Валидация перед сохранением
+
+Перед подтверждением строки:
+1. строка не пустая;
+2. базовые проверки синтаксиса (`{}`, `$`, запрещённые control chars);
+3. рендер успешен (или пользователь явно подтвердил сохранение с warning).
+
+#### 14c.4 Режимы работы
+
+- `review_all`: проход по всем строкам
+- `review_errors`: только `status=needs_review`
+- `review_unlabeled`: где нет финальной метки
+
+#### 14c.5 Критерии готовности 14c
+
+- Размечено и подтверждено >= 150 строк
+- Есть баланс классов:
+  - чистый текст
+  - чистые формулы
+  - смешанные строки
+- Нет дубликатов ключей и пустых значений в `labels.json`
+
+После завершения:
+
+```bash
+python prepare_data.py --datasets handwritten
+```
 
 **Минимальный объём:** ≥ 150 размеченных строк (текст + формулы + смешанные).
 
-После разметки прогнать `prepare_data.py --datasets handwritten`.
+Рекомендованный объём для более стабильного fine-tuning: 250-500 строк.
 
 ---
 
@@ -1023,22 +1212,91 @@ Tkinter-приложение:
 
 **Стадия 3 = handwritten 82% + synthetic replay 18%** (anti-forgetting).
 
-1. Загрузить лучший checkpoint из этапа 2 (`best_mixed.pth`)
-2. Создать комбинированный загрузчик:
-   ```python
-   train_loader, val_loader = build_multi_dataloaders(config, tokenizer, stage=3)
-   ```
-   `HandwrittenDataset` (handwritten part) и `SyntheticDataset` (replay).
-3. Разделить handwritten 80/20 train/val
-4. Дообучить:
-   - `lr = config.learning_rate * 0.1` (т.е. 3e-5)
-   - `weight_decay = 0.01`
-   - `epochs = config.epochs_finetune` (20)
-   - Early stopping `patience = config.patience` (7)
-   - Elastic: `use_elastic_handwritten=False`, `use_elastic_synthetic=True`
-     (на replay)
-5. Сохранить в `checkpoints/best_finetune.pth`
-6. Сравнить метрики до и после fine-tuning (таблица)
+#### 15.1 Preconditions перед запуском
+
+1. Готовы файлы:
+    - `my_dataset/images/*`
+    - `my_dataset/labels.json`
+    - кэш `data_cache/handwritten/manifest.json`
+2. Токенизатор содержит токены handwritten-части
+    (либо пересобран на объединённом корпусе).
+3. Доступен checkpoint Stage 2:
+    - `checkpoints/best_mixed.pth`.
+
+#### 15.2 Разбиение и сборка датасета Stage 3
+
+1. Разделить handwritten на train/val (80/20, фиксированный seed).
+2. Создать replay subset synthetic (можно полный synthetic cache,
+    можно ограниченный поднабор для ускорения эпох).
+3. Объединить датасеты и настроить sampler так, чтобы в среднем батче:
+    - 82% handwritten
+    - 18% synthetic replay
+
+Проверка: перед стартом напечатать фактические доли по 1 эпохе семплирования.
+
+#### 15.3 Гиперпараметры и режим обучения
+
+- `lr = config.learning_rate * 0.1`
+- `weight_decay = config.weight_decay`
+- `epochs = config.epochs_finetune`
+- `patience = config.patience`
+- mixed precision включён по `config.use_amp`
+- аугментации:
+  - handwritten: elastic выключен
+  - synthetic replay: elastic по `elastic_schedule_stage3`
+
+Рекомендуемый scheduler: CosineAnnealingLR или OneCycleLR с мягким спадом,
+без резких скачков LR на малом датасете.
+
+#### 15.4 Защита от forgetting и переобучения
+
+1. Каждую эпоху валидировать на двух наборах:
+    - handwritten val
+    - synthetic holdout (не из replay train-части)
+2. Если handwritten улучшается, но synthetic резко падает,
+    увеличить долю replay (например, 18% -> 25%).
+3. Если переобучение на handwritten (val loss растёт 3+ эпох),
+    усилить regularization:
+    - чуть выше dropout,
+    - ранняя остановка,
+    - уменьшить LR ещё в 1.5-2 раза.
+
+#### 15.5 Что сохранять в checkpoints
+
+Минимально:
+- веса модели
+- состояние optimizer/scheduler/scaler
+- текущая эпоха и best-metric
+- полный config snapshot
+- метрики на handwritten и synthetic
+
+Лучшие артефакты:
+- `checkpoints/best_finetune.pth`
+- `checkpoints/finetune_last.pth`
+- `checkpoints/finetune_history.json`
+
+#### 15.6 Отчёт после finetune
+
+Сформировать таблицу сравнения `mixed` vs `finetune`:
+- BLEU-4
+- ExactMatch
+- CER
+- Token Accuracy
+- Edit Distance
+
+Отдельно по срезам:
+- чистые формулы
+- чистый текст
+- смешанные строки
+
+Если есть регресс > 10% на формулах при росте качества на handwritten,
+считать конфиг нестабильным и повторить с большей долей replay.
+
+#### 15.7 Команда запуска
+
+```bash
+python finetune.py --checkpoint checkpoints/best_mixed.pth --stage 3
+```
 
 ---
 
@@ -1159,7 +1417,7 @@ streamlit run frontend.py
 ### Часть 6 — Собственный датасет и дообучение
 ```
 Шаг 14a  → labeling/slicer.py              (нарезка страниц на строки)
-Шаг 14b  → labeling/auto_label.py          (авторазметка через Gemini API)
+Шаг 14b  → labeling/auto_label.py          (авторазметка через Gemini API, LM Studio или другие API)
 Шаг 14c  → labeling/label_tool.py          (GUI верификации разметки)
            → prepare_data.py --datasets handwritten
 Шаг 15   → finetune.py                      (Stage 3: handwritten + replay)
