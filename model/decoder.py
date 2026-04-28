@@ -1,9 +1,12 @@
 import torch 
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+import sys
 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import Config
 from rope import RotaryEmbedding
-
 
 class RoPESelfAttention(nn.Module):
     def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
@@ -63,13 +66,97 @@ class RoPESelfAttention(nn.Module):
 
 
 class DecoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout):
+        super().__init__()
+
+        # подслои selfattention, cross attention, feed forward
+        self.self_attn = RoPESelfAttention(d_model, nhead, dropout)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=nhead,
+            dropout=dropout,
+            batch_first=True,
+        )
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, dim_feedforward),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim_feedforward, d_model),
+        )
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, memory): 
+        # x: [B, tgt_len, d_model]
+        # memory: [b, src_len, d_model]
+
+        # selfatt
+        x = x + self.dropout(self.self_attn(self.norm1(x)))
+
+        # cross
+        normed = self.norm2(x)
+        attn_out, _ = self.cross_attn(normed, memory, memory)
+        x = x + self.dropout(attn_out)
+
+        # ffn
+        x = x + self.dropout(self.ffn(self.norm3(x)))
+
+        return x
     
 
-if __name__ == "__main__":
-    attn = RoPESelfAttention(d_model=256, nhead=8, dropout=0.1)
-    x = torch.randn(2, 50, 256)        # batch=2, seq=50
-    out = attn(x)
-    print("Shape:", out.shape)          # torch.Size([2, 50, 256])
+class LaTeXDecoder(nn.Module):
+    def __init__(self, config: Config, vocab_size: int):
+        super().__init__()
 
-    n_params = sum(p.numel() for p in attn.parameters())
-    print(f"Параметров: {n_params:,}")  # ~263k (4 Linear по 256×256 + bias)
+        self.embedding = nn.Embedding(
+            vocab_size,
+            config.d_model,
+            padding_idx=0,
+        )
+
+        self.layers = nn.ModuleList([
+            DecoderLayer(
+                d_model=config.d_model,
+                nhead=config.nhead, 
+                dim_feedforward=config.dim_feedforward,
+                dropout=config.dropout,
+            )
+            for _ in range(config.num_decoder_layers)
+        ])
+
+        self.final_norm = nn.LayerNorm(config.d_model)
+        self.output_proj = nn.Linear(config.d_model, vocab_size)
+
+    def forward(self, tgt_ids, memory):
+        # tgt_ids: [B, tgt_len]
+        # memory:  [B, src_len, d_model]
+
+        x = self.embedding(tgt_ids) # [B, tgt_len, d_model]
+
+        for layer in self.layers:
+            x = layer(x, memory) # [B, tgt_len, d_model]
+
+        x = self.final_norm(x)
+        logits = self.output_proj(x) # [B, tgt_len, vocab_size]
+        return logits
+
+
+if __name__ == "__main__":
+    from config import load_config
+    config = load_config()
+
+    vocab_size = 1000
+    decoder = LaTeXDecoder(config, vocab_size)
+
+    tgt_ids = torch.randint(0, vocab_size, (2, 30))      # [B=2, tgt_len=30]
+    memory = torch.randn(2, 100, config.d_model)          # [B=2, src_len=100, 256]
+
+    logits = decoder(tgt_ids, memory)
+    print("Shape:", logits.shape)            # torch.Size([2, 30, 1000])
+
+    n_params = sum(p.numel() for p in decoder.parameters())
+    print(f"Параметров: {n_params:,}")       # ~4.7M
