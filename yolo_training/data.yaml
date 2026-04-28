@@ -1,0 +1,6 @@
+path: D:/notes2latex-ocr/yolo_training/dataset
+train: images/train
+val: images/val
+
+names:
+  0: line
