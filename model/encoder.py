@@ -65,33 +65,42 @@ class HybridEncoder(nn.Module):
         blocks.append(nn.AdaptiveAvgPool2d((1, None)))
 
         self.cnn = nn.Sequential(*blocks)
-
         self.pe = SinusoidalPE(config.d_model, max_len=config.max_seq_len)
+
+        # transformer encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=config.d_model,
+            nhead=config.nhead,
+            dim_feedforward=config.dim_feedforward,
+            dropout=config.dropout,
+            batch_first=True,
+        )
+
+        self.transformer = nn.TransformerEncoder (
+            encoder_layer,
+            num_layers=config.num_encoder_layers,
+            norm=nn.LayerNorm(config.d_model),
+        )
+
+    def forward(self, x):
+        x = self.cnn(x)
+        x = x.squeeze(2)
+        x = x.permute(0, 2, 1)
+        x = self.pe(x)
+        x =  self.transformer(x)
+        return x
 
         
 
-    # transformer encoder
         
 if __name__ == "__main__":
     from config import load_config
     config = load_config()
-
-    # SinusoidalPE 
-    pe = SinusoidalPE(d_model=256, max_len=512)
-    print("PE shape:", pe.pe.shape)              # torch.Size([512, 256])
-    print("PE[0]:", pe.pe[0, :4])                 # [0, 1, 0, 1] 
-
-    # Forward 
-    x = torch.randn(2, 50, 256)
-    out = pe(x)
-    print("Forward shape:", out.shape)            # torch.Size([2, 50, 256])
-
-    # Encoder + CNN + PE 
     encoder = HybridEncoder(config)
+
     x = torch.randn(2, 1, 128, 400)
-    out = encoder.cnn(x)
-    print("CNN shape:", out.shape)                # torch.Size([2, 256, 1, 100])
+    out = encoder(x)                          # ← вызываем forward целиком
+    print("Output shape:", out.shape)         # torch.Size([2, 100, 256])
 
     n_params = sum(p.numel() for p in encoder.parameters())
-    print(f"Параметров: {n_params:,}")           
-
+    print(f"Параметров: {n_params:,}")        # ~4.1M
