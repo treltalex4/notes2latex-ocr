@@ -7,8 +7,8 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
 
-from encoder import HybridEncoder
-from decoder import LaTeXDecoder
+from model.encoder import HybridEncoder
+from model.decoder import LaTeXDecoder
 
 def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)

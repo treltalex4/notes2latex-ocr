@@ -6,7 +6,7 @@ import sys
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import Config
-from rope import RotaryEmbedding
+from model.rope import RotaryEmbedding
 
 class RoPESelfAttention(nn.Module):
     def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
