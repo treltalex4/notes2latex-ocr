@@ -26,6 +26,8 @@ notebooks/
 runs/
 
 # YOLO Weights and training dataset
-yolo26m.pt
-yolo26n.pt
+yolo_training/weights
 yolo_training/dataset
+yolo_training/test_results
+yolo_labels/
+labeling/yolo_models
