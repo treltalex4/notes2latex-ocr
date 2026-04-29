@@ -31,3 +31,4 @@ yolo_training/dataset
 yolo_training/test_results
 yolo_labels/
 labeling/yolo_models
+yolo26n.pt
