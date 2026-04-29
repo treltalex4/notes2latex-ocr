@@ -112,60 +112,35 @@ class Config:
     slice_max_width: int = 2500
     slice_deskew: bool = True
 
-    slice_detect_dark_threshold: int = 75    # строгая маска: основа сегментации строк
-    slice_expand_dark_threshold: int = 130   # мягкая маска: для захвата сирот
-    slice_border_margin_px: int = 4
+    slice_detect_dark_threshold: int = 40    # строгая маска: основа сегментации строк
+    slice_expand_dark_threshold: int = 100   # мягкая маска: для захвата сирот
+    slice_border_margin_px: int = 6
 
-    slice_min_line_height: int = 20
-    slice_min_line_width: int = 60
+    slice_min_line_height: int = 12
+    slice_min_line_width: int = 40
 
-    slice_rlsa_h_kernel_factor: float = 6.0   # горизонтальное CLOSE = factor × median_h
-    slice_rlsa_v_kernel_factor: float = 0.2   # малое вертикальное CLOSE для под/надстрочных
+    slice_rlsa_h_kernel_factor: float = 1.0   # горизонтальное CLOSE = factor × median_h
+    slice_rlsa_v_kernel_factor: float = 0.1  # малое вертикальное CLOSE для под/надстрочных
     slice_min_cc_area_for_scale: int = 25     # игнорировать шумовые CC при оценке масштаба
 
-    slice_orphan_v_distance_factor: float = 1.5  # × median_h
-    slice_orphan_h_tolerance_px: int = 28
-    slice_orphan_min_area: int = 3
-    slice_orphan_max_height_factor: float = 2.0   # не захватывать крупные CC (своя строка)
+    slice_orphan_v_distance_factor: float = 4.0  # × median_h
+    slice_orphan_h_tolerance_px: int = 40
+    slice_orphan_min_area: int = 7
+    slice_orphan_max_height_factor: float = 1.0   # не захватывать крупные CC (своя строка)
 
-    slice_split_height_factor: float = 3.0     # × median_h; ниже — не делить
-    slice_split_valley_ratio: float = 0.08     # долина < ratio × пик в профиле строки
-    slice_split_min_run_factor: float = 0.30   # мин. длина долины × median_h
+    slice_split_height_factor: float = 2.75    # × median_h; ниже — не делить
+    slice_split_valley_ratio: float = 0.5    # долина < ratio × пик в профиле строки
+    slice_split_min_run_factor: float = 0.10  # мин. длина долины × median_h
 
-    slice_merge_y_overlap_ratio: float = 0.30
+    slice_merge_y_overlap_ratio: float = 0.9
 
-    slice_edge_touch_ratio: float = 0.012
-    slice_edge_expand_x: int = 14
-    slice_edge_expand_y: int = 10
-    slice_max_edge_expand_iters: int = 3
+    slice_edge_touch_ratio: float = 0.04
+    slice_edge_expand_x: int = 20
+    slice_edge_expand_y: int = 14
+    slice_max_edge_expand_iters: int = 5
 
-    slice_pad_x: int = 16
+    slice_pad_x: int = 20
     slice_pad_y: int = 14
-
-    # ── Perspective correction ────────────────────────────────────────────
-    slice_perspective_correction: bool = False  # отключено: ломает ровные фото
-    slice_perspective_min_lines: int = 6
-
-    # ── Per-line deskew (OBB) ─────────────────────────────────────────────
-    slice_per_line_deskew: bool = True
-    slice_per_line_deskew_min_angle: float = 0.5
-
-    # ── Baseline estimation for orphan assignment ─────────────────────────
-    slice_use_baseline_assignment: bool = True
-    slice_baseline_bin_width: int = 25
-
-    # ── Garbage filtering ─────────────────────────────────────────────────
-    slice_min_ink_density: float = 0.015
-    slice_min_ink_components: int = 3
-    slice_min_crop_width_ratio: float = 0.04
-    slice_min_crop_aspect_ratio: float = 0.3
-
-    # ── Contour masking ───────────────────────────────────────────────────
-    slice_contour_mask_lines: bool = True
-    slice_contour_mask_dilate: int = 3
-
-    # ── Directed RLSA ─────────────────────────────────────────────────────
-    slice_directed_rlsa: bool = True
 
     # ===== Paths =====
     data_dir: str = "data_raw"
