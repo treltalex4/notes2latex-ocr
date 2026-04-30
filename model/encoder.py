@@ -2,6 +2,7 @@ import os
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -82,13 +83,35 @@ class HybridEncoder(nn.Module):
             norm=nn.LayerNorm(config.d_model),
         )
 
-    def forward(self, x):
+    def forward(
+        self,
+        x: torch.Tensor,
+        src_key_padding_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        # x: [B, 1, H, W]
+        # src_key_padding_mask: [B, W] на пиксельной ширине, True = паддинг.
+        # Возвращает (memory, memory_key_padding_mask) — маска уже понижена под
+        # ширину memory (CNN суммарно уменьшает W в WIDTH_STRIDE раз).
         x = self.cnn(x)
         x = x.squeeze(2)
-        x = x.permute(0, 2, 1)
+        x = x.permute(0, 2, 1)  # [B, mem_len, d_model]
         x = self.pe(x)
-        x =  self.transformer(x)
-        return x
+
+        memory_kpm: torch.Tensor | None = None
+        if src_key_padding_mask is not None:
+            mem_len = x.shape[1]
+            # Понижаем пиксельную маску до memory-разрешения. Используем
+            # max_pool1d (=any): окно считается паддингом, если хоть один
+            # пиксель в нём — паддинг. Адаптивная стратегия: вычисляем
+            # фактический stride из соотношения размеров, чтобы не зависеть
+            # от хардкода даже при изменении pool_kernels.
+            pad_f = src_key_padding_mask.float().unsqueeze(1)  # [B, 1, W]
+            stride = pad_f.shape[-1] // mem_len
+            pooled = F.max_pool1d(pad_f, kernel_size=stride, stride=stride)
+            memory_kpm = pooled.squeeze(1)[:, :mem_len].bool()
+
+        x = self.transformer(x, src_key_padding_mask=memory_kpm)
+        return x, memory_kpm
 
         
 
@@ -99,8 +122,14 @@ if __name__ == "__main__":
     encoder = HybridEncoder(config)
 
     x = torch.randn(2, 1, 128, 400)
-    out = encoder(x)                          # ← вызываем forward целиком
-    print("Output shape:", out.shape)         # torch.Size([2, 100, 256])
+    out, kpm = encoder(x)
+    print("Output shape:", out.shape, "  mask:", kpm)   # torch.Size([2, 100, 256])
+
+    # С маской: последние 80 пикселей (=20 memory-токенов) паддинг
+    src_kpm = torch.zeros(2, 400, dtype=torch.bool)
+    src_kpm[:, 320:] = True
+    out2, kpm2 = encoder(x, src_key_padding_mask=src_kpm)
+    print("With mask:", out2.shape, kpm2.shape, "  pad-tokens:", kpm2.sum(dim=1).tolist())
 
     n_params = sum(p.numel() for p in encoder.parameters())
     print(f"Параметров: {n_params:,}")        # ~4.1M

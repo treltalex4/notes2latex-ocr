@@ -22,10 +22,12 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq)
 
     # поворачиваем вектора
-    def forward(self, q, k):
-        # матрица углов
+    def forward(self, q, k, offset: int = 0):
+        # матрица углов. offset позволяет сдвинуть стартовую позицию —
+        # нужно для авторегрессивного декодинга с KV-кэшем, когда в forward
+        # подаётся один новый токен, но его реальная позиция не нулевая.
         seq_len = q.shape[2]
-        t = torch.arange(seq_len, device=self.inv_freq.device)
+        t = torch.arange(seq_len, device=self.inv_freq.device) + offset
         freqs = torch.outer(t, self.inv_freq)
         emb = torch.cat([freqs, freqs], dim=-1)
 
@@ -53,4 +55,9 @@ if __name__ == "__main__":
 
     # вращение сохраняет длину вектора (норма не меняется)
     print(torch.allclose(q.norm(dim=-1), q_rot.norm(dim=-1), atol=1e-5))  # True
+
+    # offset: один токен в позиции 5 должен совпасть с пятым токеном full-prefix
+    full_q, _ = rope(q, k)
+    one_q, _ = rope(q[:, :, 5:6, :], k[:, :, 5:6, :], offset=5)
+    print(torch.allclose(full_q[:, :, 5:6, :], one_q, atol=1e-5))  # True
 
