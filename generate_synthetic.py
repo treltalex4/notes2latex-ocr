@@ -215,6 +215,28 @@ TEMPLATES: list[tuple[str, str]] = [
     (r"Разложение в ряд Фурье: $f(x) = \frac{a_0}{2} + \sum_{n=1}^{\infty}\left[a_n \cos\frac{\pi n x}{L} + b_n \sin\frac{\pi n x}{L}\right]$", "long"),
     (r"$a_n = \frac{1}{L}\int_{-L}^{L} f(x)\cos\frac{\pi n x}{L}\,dx,\quad b_n = \frac{1}{L}\int_{-L}^{L} f(x)\sin\frac{\pi n x}{L}\,dx$", "long"),
     (r"Тогда $\left\|\sum_{k=1}^n <<gk>>_k e_k\right\|^2 = \sum_{k=1}^n |<<gk>>_k|^2$ (тождество Парсеваля).", "long"),
+
+    # ── MULTI-FORMULA (several formulas per line, various spacings) ───────────
+    # Trains the model to handle \quad / \, / \; / \qquad and natural spaces
+    # between adjacent expressions — common in handwritten notes.
+    (r"$<<fn:A>>(<<var>>) = <<var>>^<<exp>>$ \quad $<<fn:B>>(<<var>>) = \sin <<var>>$",  "mixed"),
+    (r"$M_1(<<int:a>>;\, <<int:b>>)$ \quad $M_2(<<int:c>>;\, <<int:d>>)$",                "mixed"),
+    (r"$a = <<int:a>>$, \quad $b = <<int:b>>$, \quad $c = <<int:c>>$",                    "mixed"),
+    (r"$x_1 = <<int:a>>$,\; $x_2 = <<int:b>>$,\; $x_3 = <<int:c>>$",                      "mixed"),
+    (r"$<<fn>>(<<var>>) = <<int:a>>$ при $<<var>> > 0$, \quad $<<fn>>(<<var>>) = <<int:b>>$ при $<<var>> < 0$", "mixed"),
+    (r"$\lim_{n \to \infty} a_n = <<int:a>>$, \quad $\lim_{n \to \infty} b_n = <<int:b>>$", "mixed"),
+    (r"$\int_0^1 <<var>>\,d<<var>> = \frac{1}{2}$ \qquad $\int_0^1 <<var>>^2\,d<<var>> = \frac{1}{3}$", "mixed"),
+    (r"$<<fn>>'(<<var>>) = <<int>><<var>>$, \quad $<<fn>>''(<<var>>) = <<int>>$",         "mixed"),
+    (r"$A = \{<<var>> \in \mathbb{R} : <<var>> > <<int:a>>\}$, \quad $B = \{<<var>> : <<var>> < <<int:b>>\}$", "mixed"),
+    (r"$(<<int:a>>,\, <<int:b>>)$, \quad $(<<int:c>>,\, <<int:d>>)$, \quad $(<<int:e>>,\, <<int:f>>)$", "mixed"),
+    (r"Решения: $<<var>>_1 = <<int:a>>$, \quad $<<var>>_2 = <<int:b>>$, \quad $<<var>>_3 = <<int:c>>$.", "mixed"),
+    (r"$\sin <<gk>> = <<int:a>>$, \quad $\cos <<gk>> = <<int:b>>$, \quad $\mathrm{tg}\, <<gk>> = <<int:c>>$", "mixed"),
+    (r"$x = <<int:a>>$, $y = <<int:b>>$ \quad $\Rightarrow$ \quad $z = <<int:c>>$",       "mixed"),
+    (r"$<<int:a>> \leq <<var>> \leq <<int:b>>$, \quad $<<var>> \neq <<int:c>>$",          "mixed"),
+    (r"$\vec{a} = (<<int:a>>,\, <<int:b>>,\, <<int:c>>)$, \qquad $\vec{b} = (<<int:d>>,\, <<int:e>>,\, <<int:f>>)$", "mixed"),
+    (r"$<<gk:a>> = <<n:a>>^\circ$, \quad $<<gk:b>> = <<n:b>>^\circ$, \quad $<<gk:c>> = <<n:c>>^\circ$", "mixed"),
+    (r"При $<<var>> = <<int:a>>$: $<<fn>>(<<var>>) = <<int:b>>$, \quad при $<<var>> = <<int:c>>$: $<<fn>>(<<var>>) = <<int:d>>$.", "mixed"),
+    (r"$\det A = <<int:a>>$, \quad $\mathrm{tr}\, A = <<int:b>>$, \quad $\mathrm{rank}\, A = <<pos>>$", "mixed"),
 ]
 
 _TEXT_TMPLS    = [(t, c) for t, c in TEMPLATES if c == "text"]
