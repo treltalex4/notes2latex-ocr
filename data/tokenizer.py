@@ -1,5 +1,7 @@
+import json
 import re
 from collections import Counter
+from pathlib import Path
 
 
 PAD_TOKEN = "<PAD>"
@@ -82,6 +84,37 @@ class LaTeXTokenizer:
                     continue
             tokens.append(token)
         return "".join(tokens)
+
+    def save(self, path: str | Path) -> None:
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # id2token сериализуем как список (порядок = id), token2id восстановим
+        # из него при загрузке. Так гарантируется детерминированный порядок и
+        # отсутствие дубликатов.
+        tokens_in_order = [self.id2token[i] for i in range(self.vocab_size)]
+        with path.open("w", encoding="utf-8") as f:
+            json.dump({"tokens": tokens_in_order}, f, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def load(cls, path: str | Path) -> "LaTeXTokenizer":
+        path = Path(path)
+        with path.open(encoding="utf-8") as f:
+            data = json.load(f)
+        tokens: list[str] = data["tokens"]
+
+        # sanity-check: спецтокены должны быть на ожидаемых позициях
+        expected = list(SPECIAL_TOKENS)
+        if tokens[: len(expected)] != expected:
+            raise ValueError(
+                f"Повреждённый словарь: первые {len(expected)} токенов должны быть "
+                f"{expected}, получено {tokens[: len(expected)]}"
+            )
+
+        tok = cls()
+        tok.token2id = {t: i for i, t in enumerate(tokens)}
+        tok.id2token = {i: t for i, t in enumerate(tokens)}
+        tok.vocab_size = len(tokens)
+        return tok
 
     def __len__(self) -> int:
         return self.vocab_size

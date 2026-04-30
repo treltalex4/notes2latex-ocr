@@ -360,6 +360,14 @@ def generate(config: Config, target_count: int, force: bool = False) -> None:
               f"Используйте --force для повторной генерации.")
         return
 
+    if force and os.path.isdir(images_dir):
+        import shutil
+        shutil.rmtree(images_dir)
+        print(f"Удалено: {images_dir}")
+    for p in (labels_path, meta_path):
+        if os.path.exists(p):
+            os.remove(p)
+
     os.makedirs(images_dir, exist_ok=True)
 
     # Probe ALL fonts first, then pick up to synthetic_fonts_count at random.

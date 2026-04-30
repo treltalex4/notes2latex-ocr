@@ -133,22 +133,39 @@ class CollateFunction:
         self.tokenizer = tokenizer
         self.max_len = max_len
 
-    def __call__(self, batch: list[tuple[torch.Tensor, str]]) -> tuple[torch.Tensor, torch.Tensor]:
+    def __call__(
+        self, batch: list[tuple[torch.Tensor, str]],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Возвращает (images, src_key_padding_mask, tgt_ids).
+
+        - images: [B, 1, max_h, max_w] — паддинг справа значением 1.0 (белый).
+        - src_key_padding_mask: [B, max_w] — True там, где пиксельный паддинг
+          (нужно энкодеру, чтобы cross-attn декодера не attend'ил к шуму).
+          Маска по высоте не делается: после CNN высота схлопывается в 1
+          через AdaptiveAvgPool2d, поэтому вертикальный паддинг безвреден.
+        - tgt_ids: [B, real_max_len] — токены с PAD'ами в конце.
+        """
         max_h = max(img.shape[1] for img, _ in batch)
         max_w = max(img.shape[2] for img, _ in batch)
 
         batch_max_tok = max(len(self.tokenizer.tokenize(f)) for _, f in batch)
         real_max_len = min(self.max_len, batch_max_tok + 2)
 
+        B = len(batch)
+        src_kpm = torch.zeros(B, max_w, dtype=torch.bool)
+
         images, encoded_formulas = [], []
-        for image, formula in batch:
+        for i, (image, formula) in enumerate(batch):
             _, h, w = image.shape
+            if w < max_w:
+                src_kpm[i, w:] = True
             if max_w - w > 0 or max_h - h > 0:
                 image = torch.nn.functional.pad(image, (0, max_w - w, 0, max_h - h), value=1.0)
             images.append(image)
             encoded_formulas.append(self.tokenizer.encode(formula, max_len=real_max_len))
 
-        return torch.stack(images), torch.tensor(encoded_formulas, dtype=torch.long)
+        tgt_ids = torch.tensor(encoded_formulas, dtype=torch.long)
+        return torch.stack(images), src_kpm, tgt_ids
 
 
 def _compute_sample_weights(
