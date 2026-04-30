@@ -18,10 +18,20 @@ class Notes2LaTeX(nn.Module):
         super().__init__()
         self.encoder = HybridEncoder(config)
         self.decoder = LaTeXDecoder(config, vocab_size)
-    def forward(self, images, tgt_ids):
 
-        memory = self.encoder(images)
-        logits = self.decoder(tgt_ids, memory)
+    def forward(
+        self,
+        images: torch.Tensor,
+        tgt_ids: torch.Tensor,
+        src_key_padding_mask: torch.Tensor | None = None,
+        tgt_key_padding_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        memory, memory_kpm = self.encoder(images, src_key_padding_mask=src_key_padding_mask)
+        logits = self.decoder(
+            tgt_ids, memory,
+            tgt_key_padding_mask=tgt_key_padding_mask,
+            memory_key_padding_mask=memory_kpm,
+        )
         return logits
 
 if __name__ == "__main__":
