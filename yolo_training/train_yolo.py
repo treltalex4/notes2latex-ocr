@@ -1,7 +1,4 @@
-"""Train (or fine-tune) a YOLO line-detection model.
-
-All parameters are in config_y.py — edit that file to change anything.
-Weights are stored in yolo_training/weights/, runs in yolo_training/runs/.
+"""Train a YOLO line-detection model.
 
 Usage:
     python -m yolo_training.train_yolo                    # base training
@@ -85,14 +82,14 @@ def main() -> None:
 
     from ultralytics import YOLO
 
-    if weight_path.exists():
-        model = YOLO(str(weight_path))
-    else:
-        print(f"[train] Downloading {cfg.model} → {weight_path}")
-        model = YOLO(cfg.model)
-        downloaded = Path(cfg.model)
-        if downloaded.exists() and downloaded.resolve() != weight_path.resolve():
-            downloaded.replace(weight_path)
+    if not weight_path.exists():
+        raise FileNotFoundError(
+            f"Weights not found: {weight_path}\n"
+            f"Place {cfg.model} into {WEIGHTS_DIR} manually before training.\n"
+            f"(Auto-download is disabled because non-standard model names like "
+            f"'yolo26x.pt' may be silently substituted with a fallback model.)"
+        )
+    model = YOLO(str(weight_path))
 
     model.train(
         data=str(data_yaml),
