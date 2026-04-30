@@ -66,6 +66,7 @@ class Config:
         default_factory=lambda: {"text": 1.0, "formula": 1.0, "mixed": 1.0, "long": 1.0}
     )
 
+    synthetic_long_ratio: float = 0.15      # target fraction of long (>400 token) examples
     synthetic_dpi: int = 200                # разрешение рендера (DPI)
     synthetic_min_chars: int = 8            # пропускать контент короче N символов
     synthetic_max_attempts_ratio: int = 6   # max попыток рендера = count × коэффициент
