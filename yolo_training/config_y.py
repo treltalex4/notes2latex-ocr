@@ -8,30 +8,30 @@ from dataclasses import dataclass
 @dataclass
 class YoloConfig:
     # ── Model ─────────────────────────────────────────────────────────────────
-    model: str = "yolo26x.pt"
+    model: str = "yolo26s.pt"
     """Base weights file, resolved from yolo_training/weights/.
-    Alternatives: 'yolo26n.pt', 'yolo26s.pt', 'yolo26l.pt', 'yolo26x.pt'."""
+    Alternatives: 'yolo26n.pt', 'yolo26s.pt', 'yolo26m.pt' 'yolo26l.pt', 'yolo26x.pt'."""
 
     # ── Hardware ──────────────────────────────────────────────────────────────
     device: str = "0"
     """GPU index ('0'), multiple GPUs ('0,1'), or 'cpu'."""
 
     # ── Image size ────────────────────────────────────────────────────────────
-    imgsz: int = 1024
+    imgsz: int = 1280
     """Training and inference image size (pixels). Larger = slower but better
     on high-res pages; 1024 is a good default for A4 scans."""
 
     # ── Training schedule ─────────────────────────────────────────────────────
-    epochs: int = 70
+    epochs: int = 200
     """Total training epochs."""
 
-    batch: int = 2
+    batch: int = 5
     """Batch size. Use -1 for auto-detect based on GPU memory."""
 
     patience: int = 20
     """Early stopping: stop if no improvement for this many epochs."""
 
-    close_mosaic: int = 10
+    close_mosaic: int = 75
     """Disable mosaic augmentation for the last N epochs (stabilises training)."""
 
     # ── Optimiser ─────────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ class YoloConfig:
     """Prevents overconfidence on small datasets (0 = off, typical: 0.0–0.1)."""
 
     # ── Augmentation ──────────────────────────────────────────────────────────
-    degrees: float = 3.0
+    degrees: float = 1.0
     """Random rotation ±degrees. Handwritten lines are slightly tilted."""
 
     translate: float = 0.1
@@ -92,7 +92,7 @@ class YoloConfig:
     shear: float = 0.0
     """Random shear (degrees). Usually not needed for note pages."""
 
-    perspective: float = 0.00005
+    perspective: float = 0.000007
     """Random perspective warp — small value simulates slight camera tilt."""
 
     flipud: float = 0.0
@@ -111,13 +111,13 @@ class YoloConfig:
     copy_paste: float = 0.0
     """Copy-paste augmentation. Off: line bboxes are contiguous."""
 
-    hsv_h: float = 0.015
+    hsv_h: float = 0.007
     """Hue jitter (ink colour varies slightly across pens)."""
 
-    hsv_s: float = 0.3
+    hsv_s: float = 0.2
     """Saturation jitter (handwritten notes have low saturation)."""
 
-    hsv_v: float = 0.4
+    hsv_v: float = 0.2
     """Value/brightness jitter (different lighting conditions when photographed)."""
 
     # ── Fine-tuning (--finetune flag) ─────────────────────────────────────────
@@ -139,10 +139,10 @@ class YoloConfig:
     """Disable mosaic earlier in fine-tuning — fewer total epochs."""
 
     # ── Inference (test_model.py) ──────────────────────────────────────────────
-    test_conf: float = 0.35
+    test_conf: float = 0.1
     """Confidence threshold for test_model.py predictions."""
 
-    test_imgsz: int = 1024
+    test_imgsz: int = 1280
     """Image size for inference (can differ from training imgsz)."""
 
 

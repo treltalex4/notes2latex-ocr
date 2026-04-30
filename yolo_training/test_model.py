@@ -1,8 +1,5 @@
 """Run inference on all test pages and save annotated results.
 
-All parameters are in config_y.py — edit that file to change anything.
-Results are saved to yolo_training/test_results/<model_stem>/.
-
 Usage:
     python -m yolo_training.test_model
     python -m yolo_training.test_model --weights path/to/custom.pt
@@ -16,14 +13,17 @@ from pathlib import Path
 
 THIS_DIR = Path(__file__).parent
 RUNS_DIR = THIS_DIR / "runs"
-TEST_PAGES_DIR = THIS_DIR.parent / "my_dataset" / "test_pages"
+TEST_PAGES_DIR = THIS_DIR / "test_pages"
 RESULTS_DIR = THIS_DIR / "test_results"
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 
 
 def find_best_pt(model_stem: str) -> Path:
+    """Most recently modified best.pt for the given model stem (excludes
+    finetune runs — same logic as train_yolo.find_best_pt)."""
     candidates = sorted(
-        RUNS_DIR.glob(f"{model_stem}*/weights/best.pt"),
+        (p for p in RUNS_DIR.glob(f"{model_stem}*/weights/best.pt")
+         if "_finetune" not in p.parts[-3]),
         key=lambda p: p.stat().st_mtime,
     )
     if not candidates:
