@@ -172,9 +172,12 @@ def prepare_dataset(config: Config, dataset_name: str, force: bool = False) -> N
         img = crop_to_content(img)
 
         # Проверяем исходное соотношение сторон ДО resize (чтобы отловить
-        # патологически вытянутые изображения: однопиксельные строки и т.п.)
+        # патологически вытянутые изображения: однопиксельные строки и т.п.).
+        # Для handwritten порог выше, потому что строки реальных конспектов
+        # после слайсера имеют отношение w/h до ~50 (длинная формула во всю A4).
+        max_aspect = 80 if dataset_name == "handwritten" else 30
         h0, w0 = img.shape
-        if h0 == 0 or w0 / max(h0, 1) > 30:
+        if h0 == 0 or w0 / max(h0, 1) > max_aspect:
             skipped.append(f"bad_aspect_ratio\tw={w0} h={h0}\t{raw_path}")
             continue
 

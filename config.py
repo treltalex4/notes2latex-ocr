@@ -20,7 +20,7 @@ class Config:
     # ===== CNN Backbone =====
     cnn_channels: tuple = (32, 64, 128, 256)
     target_height: int = 128
-    max_width: int = 1024
+    max_width: int = 2048
 
     # ===== Training =====
     batch_size: int = 8
