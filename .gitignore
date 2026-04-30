@@ -29,6 +29,8 @@ runs/
 yolo_training/weights
 yolo_training/dataset
 yolo_training/test_results
+yolo_training/test_pages
+yolo_training/yolo_param.md
 yolo_labels/
 labeling/yolo_models
 yolo26n.pt

@@ -20,3 +20,4 @@ ipykernel
 pdf2image
 h5py
 python-doctr[torch]
+imagehash
