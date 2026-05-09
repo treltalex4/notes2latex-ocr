@@ -139,7 +139,7 @@ class YoloConfig:
     """Disable mosaic earlier in fine-tuning — fewer total epochs."""
 
     # ── Inference (test_model.py) ──────────────────────────────────────────────
-    test_conf: float = 0.1
+    test_conf: float = 0.3
     """Confidence threshold for test_model.py predictions."""
 
     test_imgsz: int = 1280
