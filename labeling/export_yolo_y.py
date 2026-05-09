@@ -155,12 +155,6 @@ def main() -> None:
         print(f"  {img_path.name}: {len(yolo_lines)} lines")
 
     print(f"\nDone. {len(images)} pages → {total_lines} line boxes total.")
-    print(f"\nImport into makesense.ai:")
-    print(f"  1. Open https://www.makesense.ai")
-    print(f"  2. Load images from:  {images_dir.resolve()}")
-    print(f"  3. Choose 'Object Detection'")
-    print(f"  4. Load labels from:  {out / 'labels.txt'}")
-    print(f"  5. Actions → Import annotations → YOLO format → folder: {labels_dir.resolve()}")
 
 
 if __name__ == "__main__":

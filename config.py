@@ -72,9 +72,14 @@ class Config:
     synthetic_max_attempts_ratio: int = 6   # max попыток рендера = count × коэффициент
 
     # ===== Augmentations =====
-    use_elastic_im2latex: bool = True       # mild elastic на im2latex
-    use_elastic_synthetic: bool = True      # medium elastic на synthetic
-    use_elastic_handwritten: bool = False   # на handwritten НЕ применяется
+    # Per-dataset elastic factor: умножается на elastic_p из расписания.
+    # 0.0 = elastic выключен полностью. 1.0 = расписание применяется как есть.
+    # im2latex: типографские формулы — нужен мягкий шум. synthetic: рендер
+    # LaTeX, должен "притворяться" рукописным — полная сила. handwritten:
+    # рукопись уже elastic от природы, дополнительный шум вреден.
+    elastic_factor_im2latex: float = 0.4
+    elastic_factor_synthetic: float = 1.0
+    elastic_factor_handwritten: float = 0.0
     augment_strength_max: float = 0.7       # верхний потолок не-elastic curriculum
 
     # Расписание elastic: list[(доля_эпох_стадии, p, alpha, sigma)]
@@ -84,8 +89,7 @@ class Config:
         (1.00, 0.2,  8, 4),     # introduce: mild
     ])
     elastic_schedule_stage2: list = field(default_factory=lambda: [
-        (0.50, 0.4, 15, 5),     # bridge: full elastic on
-        (1.00, 0.5, 20, 5),     # full strength
+        (1.00, 0.5, 20, 5),     # full strength throughout — synthetic получает 1.0×, im2latex 0.4×
     ])
     elastic_schedule_stage3: list = field(default_factory=lambda: [
         (1.00, 0.3, 10, 5),     # только на replay synthetic
