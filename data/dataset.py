@@ -25,6 +25,9 @@ class _CachedDataset(Dataset):
         self.elastic_sigma: int = 0
         self.strength: float = 0.0
         self.max_length: int = 512
+        # Per-dataset elastic multiplier. Устанавливается build_multi_dataloaders
+        # из config.elastic_factor_<dataset_type>.
+        self.elastic_factor: float = 1.0
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -35,6 +38,7 @@ class _CachedDataset(Dataset):
         img = apply_augmentations(
             img, self.dataset_type,
             self.elastic_p, self.elastic_alpha, self.elastic_sigma, self.strength,
+            elastic_factor=self.elastic_factor,
         )
         return to_tensor(img), formula
 
@@ -181,6 +185,17 @@ def _compute_sample_weights(
     return weights
 
 
+def _apply_elastic_factor(config: Config, dataset: "_CachedDataset") -> None:
+    """Установить per-dataset elastic factor из конфига. Хэндлит все
+    три типа: im2latex / synthetic / handwritten."""
+    factor_map = {
+        "im2latex":    config.elastic_factor_im2latex,
+        "synthetic":   config.elastic_factor_synthetic,
+        "handwritten": config.elastic_factor_handwritten,
+    }
+    dataset.elastic_factor = factor_map.get(dataset.dataset_type, 1.0)
+
+
 def _make_loader_kwargs(config: Config, collate_fn: CollateFunction) -> dict:
     kwargs: dict = {"collate_fn": collate_fn, "num_workers": config.num_workers, "pin_memory": True}
     if config.num_workers > 0:
@@ -208,6 +223,8 @@ def build_multi_dataloaders(
         train_ds = Im2LatexDataset(config.cache_dir, split="train", max_length=config.tokenizer_max_len)
         val_ds   = Im2LatexDataset(config.cache_dir, split="validate")
         test_ds  = Im2LatexDataset(config.cache_dir, split="test")
+        for ds in (train_ds, val_ds, test_ds):
+            _apply_elastic_factor(config, ds)
 
         train_loader = DataLoader(train_ds, batch_sampler=BucketBatchSampler(train_ds, config.batch_size, shuffle=True),  **kw)
         val_loader   = DataLoader(val_ds,   batch_sampler=BucketBatchSampler(val_ds,   config.batch_size, shuffle=False), **kw)
@@ -218,6 +235,8 @@ def build_multi_dataloaders(
         im2latex_ds  = Im2LatexDataset(config.cache_dir, split="train")
         synthetic_ds = SyntheticDataset(config.cache_dir)
         val_ds       = Im2LatexDataset(config.cache_dir, split="validate")
+        for ds in (im2latex_ds, synthetic_ds, val_ds):
+            _apply_elastic_factor(config, ds)
 
         named = [("im2latex", im2latex_ds), ("synthetic", synthetic_ds)]
         combined = ConcatDataset([ds for _, ds in named])
@@ -233,6 +252,8 @@ def build_multi_dataloaders(
         hw_train_ds  = HandwrittenDataset(config.cache_dir, split="train")
         hw_val_ds    = HandwrittenDataset(config.cache_dir, split="val")
         synthetic_ds = SyntheticDataset(config.cache_dir)
+        for ds in (hw_train_ds, hw_val_ds, synthetic_ds):
+            _apply_elastic_factor(config, ds)
 
         named = [("handwritten", hw_train_ds), ("synthetic", synthetic_ds)]
         combined = ConcatDataset([ds for _, ds in named])
