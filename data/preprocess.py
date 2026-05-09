@@ -64,22 +64,26 @@ def resize_preserve_aspect(img: np.ndarray, target_h: int, max_w: int) -> np.nda
 def apply_augmentations(
     img: np.ndarray,
     dataset_type: str,  # "im2latex" | "synthetic" | "handwritten"
-    elastic_p: float,   # 0.0 во время warmup-фазы
+    elastic_p: float,   # base из расписания эпохи
     elastic_alpha: int,
     elastic_sigma: int,
     strength: float,    # 0..1, линейно нарастает по эпохам
+    elastic_factor: float = 1.0,  # per-dataset multiplier из config
 ) -> np.ndarray:
-    # ElasticTransform — только на im2latex и synthetic (не на handwritten).
-    # alpha масштабируется по высоте изображения чтобы сдвиг был одинаковым
+    # ElasticTransform: эффективный p = elastic_p × elastic_factor.
+    # factor=0 (handwritten по умолчанию) полностью выключает elastic — никакого
+    # отдельного хардкода по dataset_type здесь больше не нужно.
+    # alpha/sigma масштабируются по высоте чтобы сдвиг был одинаковым
     # независимо от того, маленькая формула или большая.
-    if elastic_p > 0 and dataset_type != "handwritten":
+    effective_p = elastic_p * elastic_factor
+    if effective_p > 0:
         h = img.shape[0]
         scaled_alpha = float(elastic_alpha) * h / 128.0
         scaled_sigma = float(elastic_sigma) * h / 128.0
         img = A.ElasticTransform(
             alpha=scaled_alpha,
             sigma=scaled_sigma,
-            p=elastic_p,
+            p=effective_p,
         )(image=img)["image"]
 
     if strength <= 0:
