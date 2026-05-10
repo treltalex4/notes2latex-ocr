@@ -25,6 +25,7 @@ class Config:
     # ===== Training =====
     batch_size: int = 8
     grad_accum_steps: int = 4       # effective bs = batch_size * grad_accum_steps
+    grad_clip_norm: float = 1.0
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
     epochs_pretrain: int = 30       # этап 1: формулы (im2latex)
@@ -32,6 +33,8 @@ class Config:
     epochs_finetune: int = 20       # этап 3: свой датасет (с replay synthetic)
     warmup_steps: int = 1000
     patience: int = 7               # early stopping
+
+    
 
     # ===== Mixed Precision =====
     use_amp: bool = True
