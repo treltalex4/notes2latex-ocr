@@ -116,7 +116,12 @@ def _print_stats(name: str, manifest: list[dict], skipped: list[str]) -> None:
           f"max={widths.max()}")
 
 
-def prepare_dataset(config: Config, dataset_name: str, force: bool = False) -> None:
+def prepare_dataset(
+    config: Config,
+    dataset_name: str,
+    force: bool = False,
+    limit: int | None = None,
+) -> None:
     cache_subdir  = os.path.join(config.cache_dir, dataset_name)
     manifest_path = os.path.join(cache_subdir, "manifest.json")
 
@@ -152,6 +157,22 @@ def prepare_dataset(config: Config, dataset_name: str, force: bool = False) -> N
     if not raw_samples:
         print(f"  [{dataset_name}] нет сэмплов для обработки.")
         return
+
+    if limit is not None and limit > 0 and limit < len(raw_samples):
+        # Стратифицированно по сплитам: сохраняем train/validate/test
+        # пропорции, иначе на --limit 100 для im2latex может не оказаться
+        # ни одного validate/test сэмпла.
+        from collections import defaultdict
+        by_split: dict[str, list[dict]] = defaultdict(list)
+        for s in raw_samples:
+            by_split[s.get("split", "train")].append(s)
+        total = len(raw_samples)
+        sampled: list[dict] = []
+        for split, items in by_split.items():
+            n = max(1, round(len(items) / total * limit)) if items else 0
+            sampled.extend(items[:n])
+        print(f"  [{dataset_name}] --limit: {len(sampled)}/{len(raw_samples)} сэмплов")
+        raw_samples = sampled
 
     print(f"\n[{dataset_name}] обработка {len(raw_samples)} изображений "
           f"(target_h={config.target_height}, max_w={config.max_width})...")
@@ -260,6 +281,11 @@ def main() -> None:
         help="Пересчитать кэш с нуля (игнорировать существующий)",
     )
     parser.add_argument(
+        "--limit", type=int, default=None,
+        help="Ограничить число сэмплов на датасет (стратифицированно по "
+             "train/validate/test). Полезно для тестового прогона train.py.",
+    )
+    parser.add_argument(
         "--profile", default="rtx4060_8gb",
         choices=["rtx4060_8gb", "rtx5090_32gb"],
         help="GPU-профиль конфига",
@@ -273,7 +299,7 @@ def main() -> None:
     print(f"Кэш: {os.path.abspath(config.cache_dir)}\n")
 
     for ds_name in args.datasets:
-        prepare_dataset(config, ds_name, force=args.force)
+        prepare_dataset(config, ds_name, force=args.force, limit=args.limit)
 
     print("\nГотово.")
 
