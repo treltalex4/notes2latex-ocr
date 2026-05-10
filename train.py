@@ -1,6 +1,8 @@
 import argparse
+import json
 import math
 import os
+import sys
 import time
 
 import torch
@@ -16,6 +18,15 @@ from utils.metrics import token_accuracy, exact_match
 from utils.schedules import (
     get_augment_strength, get_elastic_params, get_max_length,
 )
+
+
+def _save_history(history: dict, path: str) -> None:
+    """Сохраняет историю целиком, перезаписывая файл. Атомарность через
+    write-to-tmp + rename: при крэше в момент записи не получишь обрезанный JSON."""
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
 
 
 def _train_datasets(loader):
@@ -187,10 +198,140 @@ def validate(model, loader, criterion, tokenizer, device,
     return sum(losses) / len(losses), sum(accs) / len(accs), em
 
 
+def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype,
+              stage: int, stage_name: str, epochs: int, lr_multiplier: float = 1.0):
+    """Один этап обучения. Возвращает путь к лучшему чекпоинту."""
+    print(f"\n{'=' * 60}")
+    print(f"  STAGE {stage}: {stage_name}  ({epochs} epochs, lr×{lr_multiplier})")
+    print(f"{'=' * 60}")
+
+    train_loader, val_loader, _ = build_multi_dataloaders(config, tokenizer, stage=stage)
+    print(f"Batches: train={len(train_loader)} val={len(val_loader)}")
+
+    base_lr = (args.lr if args.lr is not None else config.learning_rate) * lr_multiplier
+    optimizer = AdamW(model.parameters(), lr=base_lr, weight_decay=config.weight_decay)
+    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+
+    accum_steps = config.grad_accum_steps
+    batches_per_epoch = len(train_loader)
+    if args.limit_batches:
+        batches_per_epoch = min(batches_per_epoch, args.limit_batches)
+    steps_per_epoch = batches_per_epoch // accum_steps
+    total_steps = max(1, steps_per_epoch * epochs)
+    warmup = args.warmup_steps if args.warmup_steps is not None else config.warmup_steps
+    scheduler = make_lr_scheduler(optimizer, warmup, total_steps)
+    print(f"Scheduler: warmup={warmup} total_steps={total_steps} "
+          f"(accum={accum_steps}, effective_batch={config.batch_size * accum_steps}, "
+          f"lr_base={base_lr:.2e})")
+
+    ckpt_path = os.path.join(config.checkpoint_dir, f"best_{stage_name}.pth")
+    history_path = os.path.join(config.checkpoint_dir, f"history_{stage_name}.json")
+    history = {"stage": stage, "stage_name": stage_name, "epochs": []}
+
+    best_val_loss = float("inf")
+    epochs_no_improve = 0
+    epoch = 0   # safety: если Ctrl+C попал до первой итерации
+
+    try:
+        for epoch in range(epochs):
+            t0 = time.time()
+            print(f"\n=== Epoch {epoch + 1}/{epochs} (stage {stage}: {stage_name}) ===")
+
+            curriculum = apply_curriculum(config, train_loader, stage, epoch, epochs)
+            print(f"  curriculum: elastic_p={curriculum['elastic_p']:.2f} "
+                  f"alpha={curriculum['elastic_alpha']} sigma={curriculum['elastic_sigma']} "
+                  f"strength={curriculum['strength']:.2f} "
+                  f"max_length={curriculum['max_length']}")
+
+            train_loss, train_acc = train_one_epoch(
+                model, train_loader, optimizer, scheduler, scaler, criterion, tokenizer, device,
+                log_every=args.log_every, limit_batches=args.limit_batches,
+                grad_clip_norm=config.grad_clip_norm,
+                accum_steps=accum_steps,
+                use_amp=use_amp, amp_dtype=amp_dtype,
+            )
+
+            val_loss, val_acc, val_em = validate(
+                model, val_loader, criterion, tokenizer, device,
+                use_amp=use_amp, amp_dtype=amp_dtype,
+                n_em_batches=2, limit_batches=args.val_limit_batches,
+            )
+
+            dt = time.time() - t0
+            print(f"\nEpoch {epoch + 1} | "
+                  f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} | "
+                  f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} val_em={val_em:.3f} | "
+                  f"{dt:.1f}s")
+
+            history["epochs"].append({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "train_acc":  train_acc,
+                "val_loss":   val_loss,
+                "val_acc":    val_acc,
+                "val_em":     val_em,
+                "lr_end":     scheduler.get_last_lr()[0],
+                "curriculum": curriculum,
+                "time_seconds": dt,
+            })
+            _save_history(history, history_path)
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                epochs_no_improve = 0
+                torch.save({
+                    "stage": stage,
+                    "stage_name": stage_name,
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "val_loss": val_loss,
+                    "val_acc": val_acc,
+                    "val_em": val_em,
+                    "vocab_size": tokenizer.vocab_size,
+                }, ckpt_path)
+                print(f"  → saved best to {ckpt_path}")
+            else:
+                epochs_no_improve += 1
+                print(f"  no improvement for {epochs_no_improve}/{config.patience} epochs "
+                      f"(best val_loss={best_val_loss:.4f})")
+                if epochs_no_improve >= config.patience:
+                    print(f"\nEarly stopping: val_loss не улучшался {config.patience} эпох. "
+                          f"Лучший val_loss={best_val_loss:.4f}")
+                    break
+    except KeyboardInterrupt:
+        # Graceful shutdown: сохраняем текущее состояние (НЕ best_*.pth, чтобы
+        # не затереть лучший чекпоинт) и пробрасываем исключение наверх.
+        interrupt_path = os.path.join(config.checkpoint_dir, f"interrupt_{stage_name}.pth")
+        torch.save({
+            "stage": stage,
+            "stage_name": stage_name,
+            "epoch": epoch,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "vocab_size": tokenizer.vocab_size,
+            "interrupted": True,
+        }, interrupt_path)
+        print(f"\n[INTERRUPT] caught at epoch {epoch + 1}/{epochs}")
+        print(f"  saved interrupt state -> {interrupt_path}")
+        print(f"  best so far          -> {ckpt_path} (val_loss={best_val_loss:.4f})")
+        raise
+
+    return ckpt_path
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", default="rtx4060_8gb")
-    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--stages", type=int, nargs="+", default=[1, 2],
+                        choices=[1, 2],
+                        help="Какие этапы обучения запустить (1=pretrain, 2=mixed)")
+    parser.add_argument("--epochs-stage1", type=int, default=None,
+                        help="override config.epochs_pretrain")
+    parser.add_argument("--epochs-stage2", type=int, default=None,
+                        help="override config.epochs_mixed")
     parser.add_argument("--lr", type=float, default=None)
     parser.add_argument("--limit-batches", type=int, default=None)
     parser.add_argument("--val-limit-batches", type=int, default=None)
@@ -198,9 +339,10 @@ def main():
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--warmup-steps", type=int, default=None,
                         help="override config.warmup_steps (useful for debug runs)")
+    parser.add_argument("--resume-from", default=None,
+                        help="путь к чекпоинту для загрузки перед запуском этапов")
 
-
-    #for intel
+    # для слабого железа
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-width", type=int, default=None)
@@ -225,95 +367,59 @@ def main():
     model = Notes2LaTeX(config, tokenizer.vocab_size).to(device)
     print(f"Параметров: {count_parameters(model):,}")
 
-    train_loader, val_loader, _ = build_multi_dataloaders(config, tokenizer, stage=1)
-    print(f"Batches: train={len(train_loader)} val={len(val_loader)}")
+    if args.resume_from:
+        state = torch.load(args.resume_from, map_location=device)
+        model.load_state_dict(state["model_state_dict"])
+        print(f"Resumed model from {args.resume_from}")
 
-    lr = args.lr if args.lr is not None else config.learning_rate
-    optimizer = AdamW(model.parameters(), lr=lr, weight_decay=config.weight_decay)
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
-
-    # AMP setup. На CPU autocast/scaler работают как no-op (enabled=False).
-    # GradScaler нужен только для float16 — у bfloat16 диапазон как у fp32,
-    # underflow градиентов не происходит.
+    # AMP setup общий для всех стадий.
     amp_dtype = torch.bfloat16 if config.amp_dtype == "bfloat16" else torch.float16
     use_amp = config.use_amp and device.type == "cuda"
     scaler_enabled = use_amp and amp_dtype == torch.float16
     scaler = torch.amp.GradScaler(device.type, enabled=scaler_enabled)
     print(f"AMP: enabled={use_amp} dtype={config.amp_dtype} scaler={scaler_enabled}")
 
-    # LR scheduler: warmup + cosine annealing.
-    # total_steps считается в эффективных шагах (после grad accumulation),
-    # scheduler.step() вызывается раз в accum_steps батчей.
-    accum_steps = config.grad_accum_steps
-    batches_per_epoch = len(train_loader)
-    if args.limit_batches:
-        batches_per_epoch = min(batches_per_epoch, args.limit_batches)
-    steps_per_epoch = batches_per_epoch // accum_steps
-    total_steps = max(1, steps_per_epoch * args.epochs)
-    warmup = args.warmup_steps if args.warmup_steps is not None else config.warmup_steps
-    scheduler = make_lr_scheduler(optimizer, warmup, total_steps)
-    print(f"Scheduler: warmup={warmup} total_steps={total_steps} "
-          f"(accum_steps={accum_steps}, effective_batch={config.batch_size * accum_steps})")
-
     os.makedirs(config.checkpoint_dir, exist_ok=True)
-    best_val_loss = float("inf")
-    epochs_no_improve = 0
 
-    stage = 1  # пока хардкод; шаг 3.7 сделает multi-stage
+    # Параметры каждой стадии: epochs и LR multiplier.
+    # Stage 2 идёт с LR×0.5 — модель уже знает структуру, нужны мелкие подстройки.
+    stage_configs = {
+        1: {
+            "name": "pretrain",
+            "epochs": args.epochs_stage1 if args.epochs_stage1 is not None else config.epochs_pretrain,
+            "lr_multiplier": 1.0,
+        },
+        2: {
+            "name": "mixed",
+            "epochs": args.epochs_stage2 if args.epochs_stage2 is not None else config.epochs_mixed,
+            "lr_multiplier": 0.5,
+        },
+    }
 
-    for epoch in range(args.epochs):
-        t0 = time.time()
-        print(f"\n=== Epoch {epoch + 1}/{args.epochs} ===")
+    last_ckpt = None
+    try:
+        for stage in args.stages:
+            cfg = stage_configs[stage]
+            # Между стадиями: загружаем лучший чекпоинт предыдущей в модель,
+            # чтобы стартовать с best, а не с последнего epoch state.
+            if last_ckpt is not None:
+                state = torch.load(last_ckpt, map_location=device)
+                model.load_state_dict(state["model_state_dict"])
+                print(f"\nLoaded best from previous stage: {last_ckpt}")
 
-        curriculum = apply_curriculum(config, train_loader, stage, epoch, args.epochs)
-        print(f"  curriculum: elastic_p={curriculum['elastic_p']:.2f} "
-              f"alpha={curriculum['elastic_alpha']} sigma={curriculum['elastic_sigma']} "
-              f"strength={curriculum['strength']:.2f} "
-              f"max_length={curriculum['max_length']}")
+            last_ckpt = run_stage(
+                model, config, args, tokenizer, device,
+                scaler, use_amp, amp_dtype,
+                stage=stage, stage_name=cfg["name"],
+                epochs=cfg["epochs"], lr_multiplier=cfg["lr_multiplier"],
+            )
+    except KeyboardInterrupt:
+        # run_stage уже сохранил interrupt_*.pth и напечатал детали.
+        # Здесь просто выходим с кодом 130 (стандарт SIGINT) без traceback.
+        print("\nTraining stopped by user.")
+        sys.exit(130)
 
-        train_loss, train_acc = train_one_epoch(
-            model, train_loader, optimizer, scheduler, scaler, criterion, tokenizer, device,
-            log_every=args.log_every, limit_batches=args.limit_batches,
-            grad_clip_norm=config.grad_clip_norm,
-            accum_steps=accum_steps,
-            use_amp=use_amp, amp_dtype=amp_dtype,
-        )
-
-        val_loss, val_acc, val_em = validate(
-            model, val_loader, criterion, tokenizer, device,
-            use_amp=use_amp, amp_dtype=amp_dtype,
-            n_em_batches=2, limit_batches=args.val_limit_batches,
-        )
-
-        dt = time.time() - t0
-        print(f"\nEpoch {epoch + 1} | "
-              f"train_loss={train_loss:.4f} train_acc={train_acc:.3f} | "
-              f"val_loss={val_loss:.4f} val_acc={val_acc:.3f} val_em={val_em:.3f} | "
-              f"{dt:.1f}s")
-
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            epochs_no_improve = 0
-            ckpt_path = os.path.join(config.checkpoint_dir, "best_pretrain.pth")
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "val_loss": val_loss,
-                "val_acc": val_acc,
-                "val_em": val_em,
-                "vocab_size": tokenizer.vocab_size,
-            }, ckpt_path)
-            print(f"  → saved best to {ckpt_path}")
-        else:
-            epochs_no_improve += 1
-            print(f"  no improvement for {epochs_no_improve}/{config.patience} epochs "
-                  f"(best val_loss={best_val_loss:.4f})")
-            if epochs_no_improve >= config.patience:
-                print(f"\nEarly stopping: val_loss не улучшался {config.patience} эпох. "
-                      f"Лучший val_loss={best_val_loss:.4f}")
-                break
+    print(f"\nFinished. Last checkpoint: {last_ckpt}")
 
 
 if __name__ == "__main__":
