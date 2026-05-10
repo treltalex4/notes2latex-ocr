@@ -34,3 +34,8 @@ yolo_training/yolo_param.md
 yolo_labels/
 labeling/yolo_models
 yolo26n.pt
+
+# Тесты модели
+overfit_images/
+overfit_test.py
+smoke_test.py
