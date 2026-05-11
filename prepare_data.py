@@ -8,7 +8,7 @@ import numpy as np
 from tqdm import tqdm
 
 from config import load_config, Config
-from data.preprocess import load_image, crop_to_content, binarize, resize_preserve_aspect
+from data.preprocess import load_image, crop_to_content, resize_preserve_aspect
 from data.tokenizer import LaTeXTokenizer
 
 
@@ -203,7 +203,8 @@ def prepare_dataset(
             continue
 
         img = resize_preserve_aspect(img, config.target_height, config.max_width)
-        img = binarize(img)
+        # NB: binarize намеренно убран — храним grayscale uint8. Грид и шум
+        # обрабатываются через augmentations на тренировке, не через threshold.
 
         # Длина формулы в токенах
         token_len = len(LaTeXTokenizer.tokenize(formula))

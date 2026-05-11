@@ -14,25 +14,28 @@ class Config:
     num_decoder_layers: int = 4
     dim_feedforward: int = 1024
     dropout: float = 0.1
-    max_seq_len: int = 512          # верхний предел для позиционных индексов RoPE
+    max_seq_len: int = 1024         # верхний предел для PE encoder'а (mem_len = max_width/4)
     use_rope: bool = True           # RoPE в декодере вместо learnable PE
 
     # ===== CNN Backbone =====
     cnn_channels: tuple = (32, 64, 128, 256)
     target_height: int = 128
-    max_width: int = 2048
+    max_width: int = 3000           # покрывает 100% line_crops (max raw=3014px)
 
     # ===== Training =====
-    batch_size: int = 8
-    grad_accum_steps: int = 4       # effective bs = batch_size * grad_accum_steps
+    batch_size: int = 16            # sweet spot throughput для RTX 4060 (was 8)
+    grad_accum_steps: int = 2       # effective bs = 32 (валидировано)
     grad_clip_norm: float = 1.0
-    learning_rate: float = 3e-4
+    learning_rate: float = 1e-3     # валидировано через LR-свип (was 3e-4)
     weight_decay: float = 0.01
+    label_smoothing: float = 0.0    # CE label smoothing; 0.05–0.1 — типично для seq2seq
     epochs_pretrain: int = 30       # этап 1: формулы (im2latex)
     epochs_mixed: int = 40          # этап 2: формулы + синтетика
     epochs_finetune: int = 20       # этап 3: свой датасет (с replay synthetic)
     warmup_steps: int = 1000
     patience: int = 7               # early stopping
+    seed: int = 42                  # фиксированный seed (None = random)
+    n_em_batches: int = 20          # сколько val-батчей идёт в EM-метрику
 
     
 
@@ -56,7 +59,6 @@ class Config:
     )
 
     # ===== Dataset Quality =====
-    # (см. Manual Tuning Guide в implementation_plan.md)
     synthetic_count: int = 40_000           # целевое число изображений
     latex_templates_count: int = 500        # кол-во уникальных LaTeX-шаблонов
     synthetic_fonts_count: int = 4          # сколько шрифтов выбрать из доступных
@@ -84,6 +86,33 @@ class Config:
     elastic_factor_synthetic: float = 1.0
     elastic_factor_handwritten: float = 0.0
     augment_strength_max: float = 0.7       # верхний потолок не-elastic curriculum
+
+    # Grid augmentation: имитация тетрадной клетки на чистых im2latex/synthetic.
+    # Подготавливает модель к stage 3 (handwritten почти всегда на клетке).
+    # handwritten уже имеет грид от природы — factor=0.
+    grid_aug_prob: float = 0.8              # базовая вероятность наложения сетки
+    grid_aug_factor_im2latex: float = 1.0
+    grid_aug_factor_synthetic: float = 1.0
+    grid_aug_factor_handwritten: float = 0.0
+    grid_cell_min: int = 20                 # min размер клетки в px
+    grid_cell_max: int = 50                 # max размер клетки в px
+    grid_intensity_min: int = 160           # min яркость линий сетки (text ~50, paper ~255)
+    grid_intensity_max: int = 220           # max яркость линий сетки
+    grid_line_jitter: float = 0.04          # дрожание линий: ±jitter × cell_size px
+    grid_line_noise: int = 15               # ± шум интенсивности на каждую линию
+
+    # Базовые probability augmentations (умножаются на strength curriculum).
+    # При strength=0 ничего не применяется; при strength=1 — полная сила.
+    aug_dilate_erode_prob: float = 0.4      # утолщение/утончение штрихов
+    aug_noise_prob: float = 0.3             # gaussian noise
+    aug_noise_sigma: float = 8.0            # stddev шума
+    aug_blur_prob: float = 0.3              # gaussian blur (имитация расфокуса)
+    aug_brightness_prob: float = 0.3        # яркость/контраст
+    aug_brightness_limit: float = 0.2       # ± relative
+    aug_contrast_limit: float = 0.2         # ± relative
+    aug_affine_prob: float = 0.3            # маленький поворот + scale
+    aug_affine_rotate_deg: float = 2.0      # ± degrees
+    aug_affine_scale_pct: float = 0.05      # ± relative (0.95-1.05)
 
     # Расписание elastic: list[(доля_эпох_стадии, p, alpha, sigma)]
     # доля от 0.0 до 1.0 — относительно числа эпох текущей стадии

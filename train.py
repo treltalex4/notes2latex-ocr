@@ -2,9 +2,11 @@ import argparse
 import json
 import math
 import os
+import random
 import sys
 import time
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -18,6 +20,21 @@ from utils.metrics import token_accuracy, exact_match
 from utils.schedules import (
     get_augment_strength, get_elastic_params, get_max_length,
 )
+
+
+def _auto_run_name(args, config, base_lr: float, stage_name: str) -> str:
+    """Генерирует имя прогона из ключевых гиперпараметров + timestamp.
+    Пример: s1_lr1e-03_wd0.01_dr0.1_ls0.0_seed42_20260511-034500"""
+    seed_str = f"_seed{args.seed}" if args.seed is not None else ""
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    return (
+        f"s{1 if stage_name == 'pretrain' else 2}_"
+        f"lr{base_lr:.0e}_"
+        f"wd{config.weight_decay:g}_"
+        f"dr{config.dropout:g}_"
+        f"ls{config.label_smoothing:g}"
+        f"{seed_str}_{ts}"
+    )
 
 
 def _save_history(history: dict, path: str) -> None:
@@ -210,7 +227,10 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
 
     base_lr = (args.lr if args.lr is not None else config.learning_rate) * lr_multiplier
     optimizer = AdamW(model.parameters(), lr=base_lr, weight_decay=config.weight_decay)
-    criterion = nn.CrossEntropyLoss(ignore_index=PAD_ID)
+    criterion = nn.CrossEntropyLoss(
+        ignore_index=PAD_ID,
+        label_smoothing=config.label_smoothing,
+    )
 
     accum_steps = config.grad_accum_steps
     batches_per_epoch = len(train_loader)
@@ -225,8 +245,36 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
           f"lr_base={base_lr:.2e})")
 
     ckpt_path = os.path.join(config.checkpoint_dir, f"best_{stage_name}.pth")
-    history_path = os.path.join(config.checkpoint_dir, f"history_{stage_name}.json")
-    history = {"stage": stage, "stage_name": stage_name, "epochs": []}
+
+    # Per-run JSON — отдельный файл на каждый эксперимент. Имя берётся из
+    # args.run_name либо генерируется автоматически. Старые прогоны не
+    # теряются — каждый пишется в свой файл в runs/.
+    run_name = args.run_name or _auto_run_name(args, config, base_lr, stage_name)
+    runs_dir = os.path.join(config.checkpoint_dir, "runs")
+    os.makedirs(runs_dir, exist_ok=True)
+    history_path = os.path.join(runs_dir, f"{run_name}.json")
+    print(f"Run name:  {run_name}")
+    print(f"Logging:   {history_path}")
+
+    history = {
+        "run_name":   run_name,
+        "stage":      stage,
+        "stage_name": stage_name,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "hyperparams": {
+            "lr":              base_lr,
+            "weight_decay":    config.weight_decay,
+            "dropout":         config.dropout,
+            "label_smoothing": config.label_smoothing,
+            "batch_size":      config.batch_size,
+            "grad_accum":      config.grad_accum_steps,
+            "warmup_steps":    warmup,
+            "limit_batches":   args.limit_batches,
+            "epochs":          epochs,
+            "seed":            args.seed,
+        },
+        "epochs": [],
+    }
 
     best_val_loss = float("inf")
     epochs_no_improve = 0
@@ -254,7 +302,8 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
             val_loss, val_acc, val_em = validate(
                 model, val_loader, criterion, tokenizer, device,
                 use_amp=use_amp, amp_dtype=amp_dtype,
-                n_em_batches=2, limit_batches=args.val_limit_batches,
+                n_em_batches=args.n_em_batches,
+                limit_batches=args.val_limit_batches,
             )
 
             dt = time.time() - t0
@@ -317,9 +366,48 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
         print(f"\n[INTERRUPT] caught at epoch {epoch + 1}/{epochs}")
         print(f"  saved interrupt state -> {interrupt_path}")
         print(f"  best so far          -> {ckpt_path} (val_loss={best_val_loss:.4f})")
+        # Финализируем history даже при прерывании — данные не теряются.
+        history["interrupted"] = True
+        _finalize_history(history, history_path)
         raise
 
+    _finalize_history(history, history_path)
+    _print_run_summary(history)
     return ckpt_path
+
+
+def _finalize_history(history: dict, path: str) -> None:
+    """Добавляет финальный summary (best epoch, total time) и сохраняет."""
+    epochs = history["epochs"]
+    if epochs:
+        best_idx = min(range(len(epochs)), key=lambda i: epochs[i]["val_loss"])
+        history["best"] = {
+            "epoch":    epochs[best_idx]["epoch"],
+            "val_loss": epochs[best_idx]["val_loss"],
+            "val_acc":  epochs[best_idx]["val_acc"],
+            "val_em":   epochs[best_idx]["val_em"],
+        }
+        history["total_time_seconds"] = sum(e["time_seconds"] for e in epochs)
+        history["n_epochs_done"] = len(epochs)
+    _save_history(history, path)
+
+
+def _print_run_summary(history: dict) -> None:
+    """Финальная сводка по прогону — для удобного сравнения."""
+    if "best" not in history:
+        return
+    b = history["best"]
+    h = history["hyperparams"]
+    print(f"\n{'─' * 60}")
+    print(f"RUN SUMMARY: {history['run_name']}")
+    print(f"{'─' * 60}")
+    print(f"  lr={h['lr']:.2e}  wd={h['weight_decay']:g}  "
+          f"dropout={h['dropout']:g}  label_smoothing={h['label_smoothing']:g}")
+    print(f"  Best epoch {b['epoch'] + 1}: "
+          f"val_loss={b['val_loss']:.4f}  val_acc={b['val_acc']:.3f}  val_em={b['val_em']:.3f}")
+    print(f"  Total time: {history['total_time_seconds']:.0f}s "
+          f"({history['n_epochs_done']} epochs)")
+    print(f"  Compare:    python runs.py")
 
 
 def main():
@@ -333,17 +421,37 @@ def main():
     parser.add_argument("--epochs-stage2", type=int, default=None,
                         help="override config.epochs_mixed")
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--weight-decay", type=float, default=None,
+                        help="override config.weight_decay")
+    parser.add_argument("--dropout", type=float, default=None,
+                        help="override config.dropout (затронет архитектуру модели)")
+    parser.add_argument("--label-smoothing", type=float, default=None,
+                        help="override config.label_smoothing")
     parser.add_argument("--limit-batches", type=int, default=None)
-    parser.add_argument("--val-limit-batches", type=int, default=None)
+    parser.add_argument("--val-limit-batches", type=int, default=None,
+                        help="Ограничить число val-батчей. Без флага = full val "
+                             "(~600 батчей на im2latex). Учти: BucketBatchSampler "
+                             "сортирует по длине, ограничение даст bias на короткие.")
+    parser.add_argument("--n-em-batches", type=int, default=None,
+                        help="Override config.n_em_batches (20 по дефолту). "
+                             "Сколько val-батчей идёт в EM (greedy decode).")
     parser.add_argument("--tokenizer", default="data_cache/tokenizer.json")
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--warmup-steps", type=int, default=None,
                         help="override config.warmup_steps (useful for debug runs)")
     parser.add_argument("--resume-from", default=None,
                         help="путь к чекпоинту для загрузки перед запуском этапов")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Override config.seed. None в config = random.")
+    parser.add_argument("--run-name", default=None,
+                        help="Имя прогона для логирования в checkpoints/runs/<name>.json. "
+                             "Если не указано — генерируется автоматически из гиперпараметров.")
 
     # для слабого железа
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--grad-accum-steps", type=int, default=None,
+                        help="override config.grad_accum_steps. "
+                             "Effective batch = batch_size * grad_accum_steps.")
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-width", type=int, default=None)
 
@@ -352,12 +460,35 @@ def main():
     overrides = {}
     if args.batch_size is not None:
         overrides["batch_size"] = args.batch_size
+    if args.grad_accum_steps is not None:
+        overrides["grad_accum_steps"] = args.grad_accum_steps
     if args.num_workers is not None:
         overrides["num_workers"] = args.num_workers
     if args.max_width is not None:
         overrides["max_width"] = args.max_width
+    if args.weight_decay is not None:
+        overrides["weight_decay"] = args.weight_decay
+    if args.dropout is not None:
+        overrides["dropout"] = args.dropout
+    if args.label_smoothing is not None:
+        overrides["label_smoothing"] = args.label_smoothing
 
     config = load_config(args.profile, **overrides)
+
+    # Резолвим CLI ↔ config: CLI имеет приоритет, иначе берём из config.
+    effective_seed = args.seed if args.seed is not None else config.seed
+    if effective_seed is not None:
+        random.seed(effective_seed)
+        np.random.seed(effective_seed)
+        torch.manual_seed(effective_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(effective_seed)
+        print(f"Seed: {effective_seed}")
+    args.seed = effective_seed  # для history записи
+
+    if args.n_em_batches is None:
+        args.n_em_batches = config.n_em_batches
+
     device = torch.device(config.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 

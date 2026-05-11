@@ -28,6 +28,12 @@ class _CachedDataset(Dataset):
         # Per-dataset elastic multiplier. Устанавливается build_multi_dataloaders
         # из config.elastic_factor_<dataset_type>.
         self.elastic_factor: float = 1.0
+        # Per-dataset grid_aug. effective_prob = grid_aug_prob × grid_aug_factor.
+        self.grid_aug_prob: float = 0.0
+        self.grid_aug_factor: float = 1.0
+        # Все остальные aug-параметры (probabilities + magnitudes из config).
+        # Заполняется в build_multi_dataloaders. Дефолт — пустой dict (= захардкоженные defaults).
+        self.aug_kwargs: dict = {}
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -39,6 +45,8 @@ class _CachedDataset(Dataset):
             img, self.dataset_type,
             self.elastic_p, self.elastic_alpha, self.elastic_sigma, self.strength,
             elastic_factor=self.elastic_factor,
+            grid_aug_prob=self.grid_aug_prob * self.grid_aug_factor,
+            **self.aug_kwargs,
         )
         return to_tensor(img), formula
 
@@ -185,15 +193,43 @@ def _compute_sample_weights(
     return weights
 
 
-def _apply_elastic_factor(config: Config, dataset: "_CachedDataset") -> None:
-    """Установить per-dataset elastic factor из конфига. Хэндлит все
-    три типа: im2latex / synthetic / handwritten."""
-    factor_map = {
+def _apply_dataset_factors(config: Config, dataset: "_CachedDataset") -> None:
+    """Установить per-dataset факторы и aug-параметры из конфига."""
+    elastic_map = {
         "im2latex":    config.elastic_factor_im2latex,
         "synthetic":   config.elastic_factor_synthetic,
         "handwritten": config.elastic_factor_handwritten,
     }
-    dataset.elastic_factor = factor_map.get(dataset.dataset_type, 1.0)
+    grid_map = {
+        "im2latex":    config.grid_aug_factor_im2latex,
+        "synthetic":   config.grid_aug_factor_synthetic,
+        "handwritten": config.grid_aug_factor_handwritten,
+    }
+    dataset.elastic_factor = elastic_map.get(dataset.dataset_type, 1.0)
+    dataset.grid_aug_factor = grid_map.get(dataset.dataset_type, 1.0)
+    dataset.grid_aug_prob = config.grid_aug_prob
+
+    # Остальные aug-параметры — общие для всех датасетов.
+    dataset.aug_kwargs = {
+        "dilate_erode_prob":    config.aug_dilate_erode_prob,
+        "noise_prob":           config.aug_noise_prob,
+        "noise_sigma":          config.aug_noise_sigma,
+        "blur_prob":            config.aug_blur_prob,
+        "brightness_prob":      config.aug_brightness_prob,
+        "brightness_limit":     config.aug_brightness_limit,
+        "contrast_limit":       config.aug_contrast_limit,
+        "affine_prob":          config.aug_affine_prob,
+        "affine_rotate_deg":    config.aug_affine_rotate_deg,
+        "affine_scale_pct":     config.aug_affine_scale_pct,
+        "grid_cell_range":      (config.grid_cell_min, config.grid_cell_max),
+        "grid_intensity_range": (config.grid_intensity_min, config.grid_intensity_max),
+        "grid_jitter":          config.grid_line_jitter,
+        "grid_line_noise":      config.grid_line_noise,
+    }
+
+
+# Backward-compat alias (если где-то осталось старое имя)
+_apply_elastic_factor = _apply_dataset_factors
 
 
 def _make_loader_kwargs(config: Config, collate_fn: CollateFunction) -> dict:

@@ -1,250 +1,216 @@
-import os
-import sys
-import textwrap
+"""Визуальная проверка preprocess pipeline'а в боевых условиях.
+
+Что показывает:
+  - Картинку ТАК, как её увидит модель: после crop_to_content +
+    resize_preserve_aspect (с правильным аспектом и паддингом).
+  - Тот же сэмпл с применёнными аугментациями (elastic + grid_aug +
+    dilate/erode + noise/blur/affine).
+
+Что НЕ показывает: LaTeX-подписи, чтобы не загромождать кадр.
+
+Использование:
+    python test_pipeline.py                         # все три датасета по 10
+    python test_pipeline.py --n 5                   # 5 на датасет
+    python test_pipeline.py --skip handwritten      # пропустить датасет
+"""
+
+from __future__ import annotations
+
+import argparse
+import random
+from pathlib import Path
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import torch
-from torch.utils.data import Dataset, DataLoader
+import numpy as np
 
-import json
-
-from data.tokenizer import LaTeXTokenizer
-from data.preprocess import (
-    load_image, crop_to_content, binarize,
-    resize_preserve_aspect, apply_augmentations, preprocess_image,
-)
 from config import load_config
-
-# ──────────────────────────────────────────────
-N_IMAGES_IM2LATEX  = 10   # sample_*.png из im2latex
-N_IMAGES_SYNTHETIC =  5   # synthetic_*.png из сгенерированного датасета
-# ──────────────────────────────────────────────
-
-DATA_DIR      = r"d:\notes2latex-ocr\data_raw"
-SYNTHETIC_DIR = r"d:\notes2latex-ocr\data_synthetic"
-TEST_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test")
-os.makedirs(TEST_DIR, exist_ok=True)
+from data.preprocess import (
+    apply_augmentations, crop_to_content, load_image,
+    resize_preserve_aspect,
+)
 
 
-def _save_img(img_np, title: str, path: str, vmax=255):
-    h, w = img_np.shape[:2]
-    fig_w = max(6.0, w / 30)
-    fig_h = max(2.0, h / 30) + 0.8
-    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
-    ax.imshow(img_np, cmap="gray", vmin=0, vmax=vmax, aspect="auto")
-    ax.set_title(title, fontsize=9, family="monospace", pad=5)
-    ax.axis("off")
-    fig.tight_layout(pad=0.4)
-    fig.savefig(path, dpi=200)
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+TEST_DIR = Path(__file__).parent / "test"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Источники сэмплов
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _im2latex_samples(config, n: int, seed: int) -> list[Path]:
+    """Берёт N случайных сырых PNG из data_raw/formula_images."""
+    raw_dir = Path(config.data_dir) / "formula_images"
+    if not raw_dir.exists():
+        return []
+    files = [p for p in raw_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS]
+    rng = random.Random(seed)
+    return rng.sample(files, min(n, len(files)))
+
+
+def _synthetic_samples(config, n: int, seed: int) -> list[Path]:
+    """Берёт N случайных PNG из data_synthetic/images."""
+    images_dir = Path(config.synthetic_dir) / "images"
+    if not images_dir.exists():
+        return []
+    files = [p for p in images_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS]
+    rng = random.Random(seed)
+    return rng.sample(files, min(n, len(files)))
+
+
+def _handwritten_samples(config, n: int, seed: int) -> list[Path]:
+    """Берёт N случайных line crops из my_dataset/line_crops/crops/."""
+    crops_dir = Path(config.my_dataset_dir) / "line_crops" / "crops"
+    if not crops_dir.exists():
+        return []
+    files = [p for p in crops_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS]
+    rng = random.Random(seed)
+    return rng.sample(files, min(n, len(files)))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Обработка одного сэмпла
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _preprocess_clean(img_path: Path, target_h: int, max_w: int) -> np.ndarray | None:
+    """Чистый preprocess: crop_to_content + resize_preserve_aspect. БЕЗ augmentation."""
+    img = load_image(str(img_path))
+    if img is None:
+        return None
+    img = crop_to_content(img)
+    img = resize_preserve_aspect(img, target_h, max_w)
+    return img
+
+
+def _preprocess_aug(img: np.ndarray, dataset_type: str, config,
+                    seed: int) -> np.ndarray:
+    """Применяет full augmentation pipeline как в stage 2 train'е."""
+    random.seed(seed)
+    np.random.seed(seed)
+
+    # Эмулируем "середину stage 2" — все аугментации на полную
+    elastic_factor_map = {
+        "im2latex":    config.elastic_factor_im2latex,
+        "synthetic":   config.elastic_factor_synthetic,
+        "handwritten": config.elastic_factor_handwritten,
+    }
+    grid_factor_map = {
+        "im2latex":    config.grid_aug_factor_im2latex,
+        "synthetic":   config.grid_aug_factor_synthetic,
+        "handwritten": config.grid_aug_factor_handwritten,
+    }
+
+    return apply_augmentations(
+        img.copy(),
+        dataset_type=dataset_type,
+        elastic_p=0.5, elastic_alpha=15, elastic_sigma=5,
+        strength=0.5,
+        elastic_factor=elastic_factor_map.get(dataset_type, 1.0),
+        grid_aug_prob=config.grid_aug_prob * grid_factor_map.get(dataset_type, 1.0),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Сохранение пары clean+aug
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _save_sample(clean: np.ndarray, aug: np.ndarray,
+                 out_path: Path, name: str) -> None:
+    """Сохраняет 2 строки (clean, aug) в один PNG без LaTeX-подписей."""
+    w = clean.shape[1]
+    # Ширина фигуры пропорциональна ширине картинки
+    fig_w = max(6.0, min(22.0, w / 100.0))
+    fig, axes = plt.subplots(2, 1, figsize=(fig_w, 3.2))
+
+    axes[0].imshow(clean, cmap="gray", aspect="equal", vmin=0, vmax=255)
+    axes[0].set_title(f"{name}  CLEAN  shape={clean.shape}",
+                      fontsize=9, loc="left", family="monospace")
+    axes[0].axis("off")
+
+    axes[1].imshow(aug, cmap="gray", aspect="equal", vmin=0, vmax=255)
+    axes[1].set_title("AUGMENTED (elastic + grid + dilate/erode + noise)",
+                      fontsize=9, loc="left", family="monospace")
+    axes[1].axis("off")
+
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=100, bbox_inches="tight")
     plt.close(fig)
 
 
-# ──────────────────────────────────────────────
-# Минимальный датасет, читающий сырые PNG без кэша — только для тестов
-# ──────────────────────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# Обработка датасета целиком
+# ──────────────────────────────────────────────────────────────────────────────
 
-class _RawIm2LatexDataset(Dataset):
-    """Reads directly from raw PNG files. Used only in test_pipeline.py."""
-    dataset_type = "im2latex"
+def process_dataset(name: str, samples: list[Path], config, seed: int) -> None:
+    out_dir = TEST_DIR / name
+    # Чистим старые результаты
+    if out_dir.exists():
+        for f in out_dir.glob("*.png"):
+            f.unlink()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self, data_dir: str, split: str, target_h: int, target_w: int) -> None:
-        self.target_h = target_h
-        self.target_w = target_w
-
-        formulas_path = os.path.join(data_dir, "im2latex_formulas.lst")
-        with open(formulas_path, encoding="latin-1", newline="\n") as f:
-            self.formulas = [line.replace("\r", "").strip() for line in f]
-
-        split_path = os.path.join(data_dir, f"im2latex_{split}.lst")
-        self.samples: list[tuple[str, int]] = []
-        with open(split_path, encoding="latin-1") as f:
-            for line in f:
-                parts = line.strip().split()
-                if len(parts) < 2:
-                    continue
-                formula_idx = int(parts[0])
-                image_name = parts[1]
-                image_path = os.path.join(data_dir, "formula_images", image_name + ".png")
-                if formula_idx < len(self.formulas) and self.formulas[formula_idx]:
-                    self.samples.append((image_path, formula_idx))
-
-        self.lengths = [len(self.formulas[idx]) for _, idx in self.samples]
-        self.max_length = 512
-
-    def __len__(self) -> int:
-        return len(self.samples)
-
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, str]:
-        image_path, formula_idx = self.samples[idx]
-        formula = self.formulas[formula_idx]
-        image = preprocess_image(image_path, self.target_h, self.target_w, augment=False)
-        if image is None:
-            image = torch.zeros(1, self.target_h, 32)
-        return image, formula
-
-
-# ──────────────────────────────────────────────
-
-def test_tokenizer(data_dir: str) -> LaTeXTokenizer:
-    print("=== 1. Токенизатор ===")
-    formulas_path = os.path.join(data_dir, "im2latex_formulas.lst")
-    with open(formulas_path, encoding="latin-1", newline="\n") as f:
-        formulas = [next(f).replace("\r", "").strip() for _ in range(2000)]
-
-    tok = LaTeXTokenizer()
-    tok.build_vocab(formulas, min_freq=2)
-    print(f"  словарь: {tok.vocab_size} токенов (на 2000 формул)")
-
-    samples = [
-        (r"\frac{1}{2} + \alpha",                             "LaTeX"),
-        (r"\int_0^\infty e^{-x^2} dx = \frac{\sqrt{\pi}}{2}", "LaTeX"),
-        # Кириллица: FAIL ожидаем — vocab собран только из im2latex (без синтетики)
-        ("Лемма 1. Пусть f непрерывна на [a, b]", "Cyrillic (ожидаем FAIL без синтетики)"),
-    ]
-    for s, note in samples:
-        decoded = tok.decode(tok.encode(s))
-        ok = decoded == s
-        print(f"  {'OK  ' if ok else 'FAIL'} [{note}]  {repr(s[:50])}")
-    return tok
-
-
-def test_preprocess(data_dir: str) -> list[str]:
-    print("\n=== 2. Предобработка ===")
-    images_dir = os.path.join(data_dir, "formula_images")
-    all_files = [
-        os.path.join(images_dir, f)
-        for f in sorted(os.listdir(images_dir))
-        if f.endswith(".png")
-    ][:N_IMAGES_IM2LATEX]
-
-    config = load_config()
-    ok_count = 0
-    for path in all_files:
-        img = load_image(path)
-        if img is None:
-            print(f"  SKIP (broken): {os.path.basename(path)}")
-            continue
-        img = crop_to_content(img)
-        img = resize_preserve_aspect(img, config.target_height, config.max_width)
-        img = binarize(img)
-        ok_count += 1
-
-    print(f"  обработано {ok_count}/{len(all_files)} без ошибок")
-    return all_files
-
-
-def test_augmentations(image_path: str):
-    print("\n=== 3. Аугментации ===")
-    config = load_config()
-    img = load_image(image_path)
-    if img is None:
-        print("  SKIP: не удалось загрузить изображение")
+    if not samples:
+        print(f"[{name}] нет сэмплов (источник пуст или не найден) — пропускаю.")
         return
 
-    img = crop_to_content(img)
-    img = resize_preserve_aspect(img, config.target_height, config.max_width)
-    img = binarize(img)
+    print(f"[{name}] обработка {len(samples)} сэмплов -> {out_dir}")
+    target_h = config.target_height
+    max_w    = config.max_width
 
-    # p=1.0 гарантирует применение; alpha увеличен для наглядности
-    cases = [
-        ("aug_1_original.png",    "original",                  img, "im2latex",    0.0,  0,  0, 0.0),
-        ("aug_2_warmup.png",      "warmup  (no aug, str=0.7)", img, "im2latex",    0.0,  0,  0, 0.7),
-        ("aug_3_im2latex.png",    "im2latex elastic (a=60)",   img, "im2latex",    1.0, 60,  8, 1.0),
-        ("aug_4_synthetic.png",   "synthetic elastic (a=120)", img, "synthetic",   1.0,120, 10, 1.0),
-        ("aug_5_handwritten.png", "handwritten (no elastic)",  img, "handwritten", 1.0,120, 10, 1.0),
-    ]
-
-    for fname, label, src, dtype, ep, ea, es, st in cases:
-        out = src if ep == 0.0 and st == 0.0 else apply_augmentations(src.copy(), dtype, ep, ea, es, st)
-        _save_img(out, label, os.path.join(TEST_DIR, fname))
-        print(f"  {fname}")
-
-
-def test_dataloader(data_dir: str, tok: LaTeXTokenizer):
-    print("\n=== 4. DataLoader ===")
-    config = load_config()
-
-    from data.dataset import CollateFunction, BucketBatchSampler
-
-    dataset = _RawIm2LatexDataset(
-        data_dir, "train",
-        target_h=config.target_height,
-        target_w=config.max_width,
-    )
-    collate_fn = CollateFunction(tok, max_len=config.tokenizer_max_len)
-    train_loader = DataLoader(
-        dataset,
-        batch_sampler=BucketBatchSampler(dataset, base_batch_size=4, shuffle=True),
-        collate_fn=collate_fn,
-        num_workers=0,
-    )
-    print(f"  батчей в train: {len(train_loader)}")
-
-    for idx in range(min(N_IMAGES_IM2LATEX, len(dataset))):
-        image_path, formula_idx = dataset.samples[idx]
-        filename = os.path.basename(image_path)
-        formula = dataset.formulas[formula_idx]
-
-        img_tensor, _ = dataset[idx]
-        img_np = img_tensor[0].numpy() * 0.5 + 0.5   # [-1,1] → [0,1]
-
-        formula_wrapped = textwrap.fill(formula, width=100)
-        title = f"{filename}\n{formula_wrapped}"
-
-        save_path = os.path.join(TEST_DIR, f"sample_{idx + 1:02d}.png")
-        _save_img(img_np, title, save_path, vmax=1)
-
-    print(f"  сохранено {min(N_IMAGES_IM2LATEX, len(dataset))} изображений в {TEST_DIR}/")
-
-
-def test_synthetic_samples(synthetic_dir: str):
-    print("\n=== 5. Синтетический датасет ===")
-    labels_path = os.path.join(synthetic_dir, "labels.json")
-    if not os.path.exists(labels_path):
-        print(f"  SKIP: {labels_path} не найден.")
-        print(f"  Запустите: python generate_synthetic.py --count 200")
-        return
-
-    with open(labels_path, encoding="utf-8") as f:
-        labels: dict[str, str] = json.load(f)
-
-    config = load_config()
-    samples = list(labels.items())[:N_IMAGES_SYNTHETIC]
-    saved = 0
-
-    for i, (fname, formula) in enumerate(samples, 1):
-        image_path = os.path.join(synthetic_dir, "images", fname)
-        img = preprocess_image(image_path, config.target_height, config.max_width, augment=False)
-        if img is None:
-            print(f"  SKIP (broken): {fname}")
+    for i, p in enumerate(samples, 1):
+        clean = _preprocess_clean(p, target_h, max_w)
+        if clean is None:
+            print(f"  [skip] не удалось загрузить: {p.name}")
             continue
+        aug = _preprocess_aug(clean, dataset_type=name, config=config, seed=seed * 100 + i)
+        out_path = out_dir / f"{i:03d}_{p.stem}.png"
+        _save_sample(clean, aug, out_path, name=p.name)
+        print(f"  {out_path.name}  ({clean.shape[1]}px wide)")
 
-        img_np = img[0].numpy() * 0.5 + 0.5   # [-1,1] → [0,1]
-        formula_wrapped = textwrap.fill(formula, width=100)
-        title = f"{fname}\n{formula_wrapped}"
 
-        save_path = os.path.join(TEST_DIR, f"synthetic_{i:02d}.png")
-        _save_img(img_np, title, save_path, vmax=1)
-        print(f"  synthetic_{i:02d}.png")
-        saved += 1
-
-    print(f"  сохранено {saved} изображений из синтетики в {TEST_DIR}/")
-
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    if not os.path.isdir(DATA_DIR):
-        print(f"Датасет не найден: {DATA_DIR}")
-        print("Скачайте im2latex-100k и распакуйте в data_raw/")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Визуальная проверка preprocess + augmentation.")
+    parser.add_argument("--n", type=int, default=10,
+                        help="Сколько сэмплов на датасет (default: 10)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--skip", nargs="*", default=[],
+                        choices=["im2latex", "synthetic", "handwritten"],
+                        help="Какие датасеты пропустить")
+    parser.add_argument("--profile", default="rtx4060_8gb")
+    args = parser.parse_args()
 
-    tok = test_tokenizer(DATA_DIR)
-    image_files = test_preprocess(DATA_DIR)
-    if image_files:
-        test_augmentations(image_files[0])
-    test_dataloader(DATA_DIR, tok)
-    test_synthetic_samples(SYNTHETIC_DIR)
-    print("\nВсе проверки завершены.")
+    config = load_config(args.profile)
+    TEST_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"Config:        target_h={config.target_height}  max_w={config.max_width}")
+    print(f"Grid aug:      prob={config.grid_aug_prob}  factors: "
+          f"i={config.grid_aug_factor_im2latex} "
+          f"s={config.grid_aug_factor_synthetic} "
+          f"h={config.grid_aug_factor_handwritten}")
+    print(f"Output:        {TEST_DIR}")
+    print()
+
+    if "im2latex" not in args.skip:
+        process_dataset("im2latex",
+                        _im2latex_samples(config, args.n, args.seed),
+                        config, args.seed)
+    if "synthetic" not in args.skip:
+        process_dataset("synthetic",
+                        _synthetic_samples(config, args.n, args.seed),
+                        config, args.seed)
+    if "handwritten" not in args.skip:
+        process_dataset("handwritten",
+                        _handwritten_samples(config, args.n, args.seed),
+                        config, args.seed)
+
+    print("\nГотово.")
 
 
 if __name__ == "__main__":
