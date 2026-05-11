@@ -40,3 +40,8 @@ overfit_images/
 overfit_test.py
 smoke_test.py
 test_lines/
+analyze_crops.py
+analyze_data.py
+find_batch_size.py
+test_binarize.py
+test_grid_aug.py
