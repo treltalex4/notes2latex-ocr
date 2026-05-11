@@ -39,3 +39,4 @@ yolo26n.pt
 overfit_images/
 overfit_test.py
 smoke_test.py
+test_lines/
