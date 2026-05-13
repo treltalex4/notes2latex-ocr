@@ -6,6 +6,7 @@
     python evaluate.py --checkpoint ... --save-predictions preds.json --plot-history
 """
 import argparse
+import glob
 import json
 import os
 import time
@@ -24,27 +25,7 @@ from utils.metrics import (
 from utils.visualization import plot_learning_curves, show_predictions
 
 
-@torch.no_grad()
-def greedy_decode_batch(model, images, src_kpm, tokenizer, device, max_len=200):
-    """Жадная декодировка батча — копия из train.py для независимости evaluate."""
-    from data.tokenizer import EOS_ID, PAD_ID, SOS_ID
-    model.eval()
-    B = images.shape[0]
-    memory, memory_kpm = model.encoder(images, src_key_padding_mask=src_kpm)
-
-    generated = torch.full((B, 1), SOS_ID, dtype=torch.long, device=device)
-    finished = torch.zeros(B, dtype=torch.bool, device=device)
-
-    for _ in range(max_len - 1):
-        logits = model.decoder(generated, memory, memory_key_padding_mask=memory_kpm)
-        next_ids = logits[:, -1, :].argmax(dim=-1)
-        next_ids = torch.where(finished, torch.full_like(next_ids, PAD_ID), next_ids)
-        generated = torch.cat([generated, next_ids.unsqueeze(1)], dim=1)
-        finished = finished | (next_ids == EOS_ID)
-        if finished.all():
-            break
-
-    return [tokenizer.decode(generated[i].tolist()) for i in range(B)]
+from train import greedy_decode_batch  # KV-cached декод — единый источник правды
 
 
 @torch.no_grad()
@@ -68,7 +49,7 @@ def run_evaluation(model, loader, tokenizer, config, device,
 
         # Предсказания
         if use_greedy:
-            predictions = greedy_decode_batch(model, images, src_kpm, tokenizer, device)
+            predictions = greedy_decode_batch(model, images, src_kpm, tokenizer, device, max_len=config.beam_max_len)
         else:
             # Beam search по одному изображению — медленно, но корректно.
             predictions = []
@@ -194,11 +175,27 @@ def main():
     # --- Plot history ---
     if args.plot_history:
         stage_name = state.get("stage_name", "pretrain")
-        history_path = os.path.join(config.checkpoint_dir, f"history_{stage_name}.json")
-        if os.path.exists(history_path):
+        runs_dir = os.path.join(config.checkpoint_dir, "runs")
+        candidates = sorted(
+            glob.glob(os.path.join(runs_dir, "*.json")),
+            key=os.path.getmtime,
+            reverse=True,
+        )
+        history_path = None
+        for path in candidates:
+            try:
+                with open(path, encoding="utf-8") as f:
+                    meta = json.load(f)
+                if meta.get("stage_name") == stage_name:
+                    history_path = path
+                    break
+            except Exception:
+                continue
+        if history_path:
+            print(f"plotting history: {history_path}")
             plot_learning_curves(history_path, config.plots_dir)
         else:
-            print(f"history not found: {history_path}")
+            print(f"history not found for stage '{stage_name}' in {runs_dir}/")
 
     # --- Show predictions PNG ---
     if args.show_predictions > 0:

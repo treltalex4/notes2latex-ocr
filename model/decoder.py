@@ -27,9 +27,13 @@ class RoPESelfAttention(nn.Module):
         x: torch.Tensor,
         key_padding_mask: torch.Tensor | None = None,
         position_offset: int = 0,
-    ) -> torch.Tensor:
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         # x: [B, seq_len, d_model]
         # key_padding_mask: [B, seq_len], True = маскировать
+        # kv_cache: (K_past, V_past) с [B, nhead, T_past, head_dim] для авторегрессивного декода.
+        # use_cache: вернуть обновлённый (K_full, V_full) для следующего шага.
         B, seq_len, _ = x.shape
         qkv = self.qkv(x).view(B, seq_len, 3, self.nhead, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # [3, B, nhead, seq_len, head_dim]
@@ -37,9 +41,24 @@ class RoPESelfAttention(nn.Module):
 
         q, k = self.rope(q, k, offset=position_offset)
 
+        if kv_cache is not None:
+            k_past, v_past = kv_cache
+            k = torch.cat([k_past, k], dim=2)
+            v = torch.cat([v_past, v], dim=2)
+
+        new_cache = (k, v) if use_cache else None
+
         # SDPA не позволяет одновременно is_causal=True и attn_mask, поэтому при
         # наличии padding-маски собираем единую булеву маску [B, 1, S, S].
-        if key_padding_mask is not None:
+        if kv_cache is not None:
+            # Декод с кэшем: Q — только новые токены, K/V содержат всю историю.
+            # Causal-маска не нужна — будущих токенов в K/V просто нет.
+            out = F.scaled_dot_product_attention(
+                q, k, v,
+                is_causal=False,
+                dropout_p=self.dropout.p if self.training else 0.0,
+            )
+        elif key_padding_mask is not None:
             causal = torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device).triu(1)
             # True = заблокировать. Паддинг блокируем по столбцам (keys).
             pad = key_padding_mask[:, None, None, :]  # [B, 1, 1, seq_len]
@@ -60,7 +79,7 @@ class RoPESelfAttention(nn.Module):
         out = self.W_o(out)
         # Dropout не применяется здесь — внешний residual dropout в DecoderLayer
         # покрывает этот путь (иначе получается двойной dropout, p_eff = 1-(1-p)²).
-        return out
+        return out, new_cache
 
 
 class DecoderLayer(nn.Module):
@@ -92,13 +111,18 @@ class DecoderLayer(nn.Module):
         tgt_key_padding_mask: torch.Tensor | None = None,
         memory_key_padding_mask: torch.Tensor | None = None,
         position_offset: int = 0,
-    ) -> torch.Tensor:
+        self_attn_cache: tuple[torch.Tensor, torch.Tensor] | None = None,
+        use_cache: bool = False,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
         # selfatt
-        x = x + self.dropout(self.self_attn(
+        sa_out, new_cache = self.self_attn(
             self.norm1(x),
             key_padding_mask=tgt_key_padding_mask,
             position_offset=position_offset,
-        ))
+            kv_cache=self_attn_cache,
+            use_cache=use_cache,
+        )
+        x = x + self.dropout(sa_out)
 
         # cross
         normed = self.norm2(x)
@@ -111,7 +135,7 @@ class DecoderLayer(nn.Module):
 
         # ffn
         x = x + self.dropout(self.ffn(self.norm3(x)))
-        return x
+        return x, new_cache
 
 
 class LaTeXDecoder(nn.Module):
@@ -153,7 +177,7 @@ class LaTeXDecoder(nn.Module):
         x = self.embedding(tgt_ids)
 
         for layer in self.layers:
-            x = layer(
+            x, _ = layer(
                 x, memory,
                 tgt_key_padding_mask=tgt_key_padding_mask,
                 memory_key_padding_mask=memory_key_padding_mask,
@@ -163,6 +187,45 @@ class LaTeXDecoder(nn.Module):
         x = self.final_norm(x)
         logits = self.output_proj(x)
         return logits
+
+    def forward_step(
+        self,
+        tgt_ids: torch.Tensor,
+        memory: torch.Tensor,
+        memory_key_padding_mask: torch.Tensor | None = None,
+        kv_caches: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        position_offset: int = 0,
+    ) -> tuple[torch.Tensor, list[tuple[torch.Tensor, torch.Tensor]]]:
+        """Один шаг авторегрессивного декода с KV-кэшем.
+
+        tgt_ids: [B, 1] — новый токен (или [B, T] при первом вызове).
+        kv_caches: list длины num_layers, каждый элемент — (K, V) с
+          [B, nhead, T_past, head_dim]. None при первом шаге.
+        position_offset: позиция первого токена tgt_ids в полной
+          последовательности (= размер кэша к моменту вызова).
+
+        Возвращает (logits, new_caches):
+          logits — [B, T_new, vocab], где T_new = tgt_ids.shape[1].
+          new_caches — обновлённые кэши для следующего шага.
+        """
+        x = self.embedding(tgt_ids)
+        new_caches: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+        for i, layer in enumerate(self.layers):
+            layer_cache = kv_caches[i] if kv_caches is not None else None
+            x, new_cache = layer(
+                x, memory,
+                tgt_key_padding_mask=None,   # авторегрессивно — паддинга в кэше нет
+                memory_key_padding_mask=memory_key_padding_mask,
+                position_offset=position_offset,
+                self_attn_cache=layer_cache,
+                use_cache=True,
+            )
+            new_caches.append(new_cache)
+
+        x = self.final_norm(x)
+        logits = self.output_proj(x)
+        return logits, new_caches
 
 
 if __name__ == "__main__":

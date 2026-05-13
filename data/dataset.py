@@ -133,11 +133,19 @@ class BucketBatchSampler(Sampler):
                 random.shuffle(batch)
                 yield batch
         else:
+            # Fixed-seed shuffle of batch ORDER so val sampling (n_em_batches,
+            # val_limit_batches) sees a representative length mix instead of
+            # only the shortest sequences. Within-batch order kept.
+            rng = random.Random(0)
+            rng.shuffle(batches)
             yield from batches
 
     def __len__(self) -> int:
-        # batch count is independent of shuffle order, so just generate without side-effects
-        return len(self._generate_batches())
+        # Restore global RNG state after the call so __len__ has no side effects.
+        saved = random.getstate()
+        n = len(self._generate_batches())
+        random.setstate(saved)
+        return n
 
 
 class CollateFunction:
@@ -193,8 +201,13 @@ def _compute_sample_weights(
     return weights
 
 
-def _apply_dataset_factors(config: Config, dataset: "_CachedDataset") -> None:
-    """Установить per-dataset факторы и aug-параметры из конфига."""
+def _apply_dataset_factors(config: Config, dataset: "_CachedDataset", is_train: bool = True) -> None:
+    """Установить per-dataset факторы и aug-параметры из конфига.
+
+    is_train=False для val/test: grid_aug_prob=0, чтобы метрики были
+    воспроизводимы между эпохами и измеряли target distribution без
+    синтетических искажений.
+    """
     elastic_map = {
         "im2latex":    config.elastic_factor_im2latex,
         "synthetic":   config.elastic_factor_synthetic,
@@ -207,7 +220,7 @@ def _apply_dataset_factors(config: Config, dataset: "_CachedDataset") -> None:
     }
     dataset.elastic_factor = elastic_map.get(dataset.dataset_type, 1.0)
     dataset.grid_aug_factor = grid_map.get(dataset.dataset_type, 1.0)
-    dataset.grid_aug_prob = config.grid_aug_prob
+    dataset.grid_aug_prob = config.grid_aug_prob if is_train else 0.0
 
     # Остальные aug-параметры — общие для всех датасетов.
     dataset.aug_kwargs = {
@@ -232,11 +245,25 @@ def _apply_dataset_factors(config: Config, dataset: "_CachedDataset") -> None:
 _apply_elastic_factor = _apply_dataset_factors
 
 
+def _worker_init_fn(worker_id: int) -> None:
+    """Seed numpy per-worker. PyTorch seeds random/torch automatically but not numpy."""
+    seed = (torch.initial_seed() + worker_id) % (2**32)
+    np.random.seed(seed)
+
+
 def _make_loader_kwargs(config: Config, collate_fn: CollateFunction) -> dict:
-    kwargs: dict = {"collate_fn": collate_fn, "num_workers": config.num_workers, "pin_memory": True}
+    # persistent_workers НЕ используем: воркеры форкаются на первой итерации и
+    # держат snapshot датасета — curriculum-апдейты elastic_p/strength из main
+    # никогда не доходят до них. Респавн каждую эпоху подхватывает актуальные
+    # значения и заодно ресидит numpy через worker_init_fn.
+    kwargs: dict = {
+        "collate_fn": collate_fn,
+        "num_workers": config.num_workers,
+        "pin_memory": True,
+    }
     if config.num_workers > 0:
         kwargs["prefetch_factor"] = config.prefetch_factor
-        kwargs["persistent_workers"] = True  # avoid worker respawn overhead between epochs
+        kwargs["worker_init_fn"] = _worker_init_fn
     return kwargs
 
 
@@ -259,8 +286,9 @@ def build_multi_dataloaders(
         train_ds = Im2LatexDataset(config.cache_dir, split="train", max_length=config.tokenizer_max_len)
         val_ds   = Im2LatexDataset(config.cache_dir, split="validate")
         test_ds  = Im2LatexDataset(config.cache_dir, split="test")
-        for ds in (train_ds, val_ds, test_ds):
-            _apply_elastic_factor(config, ds)
+        _apply_elastic_factor(config, train_ds, is_train=True)
+        _apply_elastic_factor(config, val_ds,   is_train=False)
+        _apply_elastic_factor(config, test_ds,  is_train=False)
 
         train_loader = DataLoader(train_ds, batch_sampler=BucketBatchSampler(train_ds, config.batch_size, shuffle=True),  **kw)
         val_loader   = DataLoader(val_ds,   batch_sampler=BucketBatchSampler(val_ds,   config.batch_size, shuffle=False), **kw)
@@ -271,8 +299,9 @@ def build_multi_dataloaders(
         im2latex_ds  = Im2LatexDataset(config.cache_dir, split="train")
         synthetic_ds = SyntheticDataset(config.cache_dir)
         val_ds       = Im2LatexDataset(config.cache_dir, split="validate")
-        for ds in (im2latex_ds, synthetic_ds, val_ds):
-            _apply_elastic_factor(config, ds)
+        _apply_elastic_factor(config, im2latex_ds,  is_train=True)
+        _apply_elastic_factor(config, synthetic_ds, is_train=True)
+        _apply_elastic_factor(config, val_ds,       is_train=False)
 
         named = [("im2latex", im2latex_ds), ("synthetic", synthetic_ds)]
         combined = ConcatDataset([ds for _, ds in named])
@@ -288,8 +317,9 @@ def build_multi_dataloaders(
         hw_train_ds  = HandwrittenDataset(config.cache_dir, split="train")
         hw_val_ds    = HandwrittenDataset(config.cache_dir, split="val")
         synthetic_ds = SyntheticDataset(config.cache_dir)
-        for ds in (hw_train_ds, hw_val_ds, synthetic_ds):
-            _apply_elastic_factor(config, ds)
+        _apply_elastic_factor(config, hw_train_ds,  is_train=True)
+        _apply_elastic_factor(config, hw_val_ds,    is_train=False)
+        _apply_elastic_factor(config, synthetic_ds, is_train=True)
 
         named = [("handwritten", hw_train_ds), ("synthetic", synthetic_ds)]
         combined = ConcatDataset([ds for _, ds in named])

@@ -491,8 +491,7 @@ def main() -> None:
     target = args.count if args.count is not None else config.synthetic_count
     print(f"Профиль: {args.profile}  цель: {target} изображений")
     print(f"Выход: {os.path.abspath(config.synthetic_dir)}")
-    print(f"Шаблонов: {len(TEMPLATES)} ({len(_LONG_TMPLS)} длинных, "
-          f"long_ratio={config.synthetic_long_ratio})\n")
+    print(f"Шаблонов: {len(TEMPLATES)} ({len(_LONG_TMPLS)} длинных)\n")
 
     generate(config, target_count=target, force=args.force)
 

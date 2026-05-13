@@ -13,38 +13,38 @@ class Config:
     num_encoder_layers: int = 4
     num_decoder_layers: int = 4
     dim_feedforward: int = 1024
-    dropout: float = 0.1
+    dropout: float = 0.12
     max_seq_len: int = 1024         # верхний предел для PE encoder'а (mem_len = max_width/4)
     use_rope: bool = True           # RoPE в декодере вместо learnable PE
 
     # ===== CNN Backbone =====
     cnn_channels: tuple = (32, 64, 128, 256)
     target_height: int = 128
-    max_width: int = 3000           # покрывает 100% line_crops (max raw=3014px)
+    max_width: int = 2800
 
     # ===== Training =====
-    batch_size: int = 16            # sweet spot throughput для RTX 4060 (was 8)
-    grad_accum_steps: int = 2       # effective bs = 32 (валидировано)
-    grad_clip_norm: float = 1.0
-    learning_rate: float = 1e-3     # валидировано через LR-свип (was 3e-4)
-    weight_decay: float = 0.01
-    label_smoothing: float = 0.0    # CE label smoothing; 0.05–0.1 — типично для seq2seq
-    epochs_pretrain: int = 30       # этап 1: формулы (im2latex)
+    batch_size: int = 12            # снижено с 16 → запас VRAM на широкие картинки
+    grad_accum_steps: int = 2       # effective bs = 24 (lr=1e-3 валидирован при bs=32, разница 25% — терпимо)
+    grad_clip_norm: float = 0.98
+    learning_rate: float = 3e-4
+    weight_decay: float = 0.0003
+    label_smoothing: float = 0.055    # CE label smoothing; 0.05–0.1 — типично для seq2seq
+    epochs_pretrain: int = 40       # этап 1: формулы (im2latex)
     epochs_mixed: int = 40          # этап 2: формулы + синтетика
     epochs_finetune: int = 20       # этап 3: свой датасет (с replay synthetic)
-    warmup_steps: int = 1000
-    patience: int = 7               # early stopping
+    warmup_steps: int = 3000
+    patience: int = 8               # early stopping (20% от epochs_pretrain)
     seed: int = 42                  # фиксированный seed (None = random)
-    n_em_batches: int = 20          # сколько val-батчей идёт в EM-метрику
+    n_em_batches: int = 150          # сколько val-батчей идёт в EM-метрику
 
     
 
     # ===== Mixed Precision =====
     use_amp: bool = True
-    amp_dtype: str = "float16"      # "float16" | "bfloat16"
+    amp_dtype: str = "bfloat16"      # "float16" | "bfloat16"
 
     # ===== Data Loading =====
-    num_workers: int = 4
+    num_workers: int = 6
     prefetch_factor: int = 2
 
     # ===== Datasets =====
@@ -67,11 +67,12 @@ class Config:
     # Шаблоны выбираются равновероятно из общего пула (80 шт.).
     # Естественное распределение: text≈25%, formula≈36%, mixed≈29%, long≈22%.
     # synthetic_template_weights — опциональные веса по категориям (None = равномерно)
+    # Для увеличения доли длинных примеров — поднять synthetic_template_weights["long"].
+    # Например {"long": 2.0, ...} даёт вдвое больше длинных шаблонов.
     synthetic_template_weights: dict = field(
         default_factory=lambda: {"text": 1.0, "formula": 1.0, "mixed": 1.0, "long": 1.0}
     )
 
-    synthetic_long_ratio: float = 0.15      # target fraction of long (>400 token) examples
     synthetic_dpi: int = 200                # разрешение рендера (DPI)
     synthetic_min_chars: int = 8            # пропускать контент короче N символов
     synthetic_max_attempts_ratio: int = 6   # max попыток рендера = count × коэффициент
@@ -85,7 +86,7 @@ class Config:
     elastic_factor_im2latex: float = 0.4
     elastic_factor_synthetic: float = 1.0
     elastic_factor_handwritten: float = 0.0
-    augment_strength_max: float = 0.7       # верхний потолок не-elastic curriculum
+    augment_strength_max: float = 0.6       # верхний потолок не-elastic curriculum
 
     # Grid augmentation: имитация тетрадной клетки на чистых im2latex/synthetic.
     # Подготавливает модель к stage 3 (handwritten почти всегда на клетке).

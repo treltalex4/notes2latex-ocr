@@ -1,18 +1,19 @@
 """Optuna-based hyperparameter search для stage 1 (im2latex pretrain).
 
-Запускает N коротких трейлов, каждый = K эпох × M батчей на сабсете im2latex.
+Запускает N трейлов на ПОЛНОМ датасете (без --limit-batches).
 Минимизирует val_loss (или максимизирует val_em через --metric val_em).
-Поддерживает MedianPruner для досрочного убийства плохих трейлов.
+MedianPruner убивает плохие трейлы досрочно.
 
 Использование:
-    # Быстрая проверка
-    python tune.py --n-trials 2 --epochs 1 --limit-batches 20
+    # Стандартный overnight поиск: 15 трейлов × 6 эпох на полном датасете.
+    # Ожидаемо ~3-4 будут pruned досрочно → ~15-18 часов на RTX 4060.
+    python tune.py
 
-    # Реальный поиск
-    python tune.py --n-trials 40 --epochs 3 --limit-batches 500
+    # С указанием study name (для resume после прерывания)
+    python tune.py --study-name lr_search_v2 --storage sqlite:///optuna.db
 
-    # С resume через sqlite
-    python tune.py --n-trials 100 --study-name lr_v1 --storage sqlite:///optuna.db
+    # Быстрый smoke-тест (не для реального поиска)
+    python tune.py --n-trials 2 --epochs 1 --limit-batches 50
 
 Результаты пишутся в --output (по умолчанию checkpoints/tune_results.json):
 лучший трейл, топ-5, search space, готовая CLI-команда для train.py.
@@ -45,23 +46,26 @@ from train import (
 )
 
 
-# Search space НАРРОВАННЫЙ — диапазоны вокруг валидированных вручную оптимумов.
+# Search space расширен для полного датасета. Прошлые ручные прогоны делались
+# на limit_batches и искажали верх диапазона LR — на полном датасете и bf16
+# модель потенциально стабильна и при более высоких LR. Pruner отсечёт плохое.
 # Что НЕ в search:
-#   weight_decay: ручной свип (0, 0.01, 0.05, 0.1) на сабсете не дал сигнала.
-#   warmup_steps: при коротких трейлах (~1000 optim steps) tune может сэмплить
-#                 значения, при которых warmup не успевает завершиться, что
-#                 даёт ложный сигнал. Дефолт 1000 уже валидирован на full pretrain.
+#   warmup_steps: адаптируется к длине трейла автоматически (см. ниже).
+#   batch_size / grad_accum_steps: упираются в VRAM, инженерный параметр.
+#   grad_clip_norm: safety mechanism, на bf16 в стабильной зоне не двигает loss.
 SEARCH_SPACE = {
-    "learning_rate":   {"low": 5e-4,  "high": 3e-3,  "log": True},     # вокруг 1e-3
-    "dropout":         {"low": 0.05,  "high": 0.20,  "log": False},    # вокруг 0.1
-    "label_smoothing": {"low": 0.0,   "high": 0.15,  "log": False},    # untested
+    "learning_rate":   {"low": 5e-5,  "high": 1e-3,  "log": True},
+    "weight_decay":    {"low": 1e-4,  "high": 1e-1,  "log": True},
+    "dropout":         {"low": 0.05,  "high": 0.30,  "log": False},
+    "label_smoothing": {"low": 0.0,   "high": 0.15,  "log": False},
 }
 
 
 def _sample_params(trial: optuna.Trial) -> dict[str, Any]:
     return {
-        "learning_rate":   trial.suggest_float("learning_rate",   5e-4, 3e-3, log=True),
-        "dropout":         trial.suggest_float("dropout",         0.05, 0.20),
+        "learning_rate":   trial.suggest_float("learning_rate",   5e-5, 1e-3, log=True),
+        "weight_decay":    trial.suggest_float("weight_decay",    1e-4, 1e-1, log=True),
+        "dropout":         trial.suggest_float("dropout",         0.05, 0.30),
         "label_smoothing": trial.suggest_float("label_smoothing", 0.0,  0.15),
     }
 
@@ -112,11 +116,13 @@ def make_objective(args, base_overrides: dict, tokenizer: LaTeXTokenizer, device
         steps_per_epoch = max(1, batches_per_epoch // accum_steps)
         total_steps = max(1, steps_per_epoch * args.epochs)
 
-        # Warmup адаптируется под длину трейла (10% от total_steps, min 30).
-        # Иначе config.warmup_steps=1000 может не успеть завершиться в коротком
-        # трейле и trial выдаст ложный сигнал ("низкий lr — лучше" просто потому
-        # что lr никогда не достигал base_lr).
-        trial_warmup = max(30, int(total_steps * 0.10))
+        # Warmup: используем config.warmup_steps если он помещается в трейл
+        # (< 50% total_steps). Иначе масштабируем до 15% — это гарантирует
+        # что warmup завершится и модель успеет поработать при целевом LR.
+        if config.warmup_steps <= total_steps * 0.5:
+            trial_warmup = config.warmup_steps
+        else:
+            trial_warmup = max(30, int(total_steps * 0.15))
         if trial.number == 0:
             print(f"  Trial budget: total_steps={total_steps}  warmup={trial_warmup}")
 
@@ -132,11 +138,12 @@ def make_objective(args, base_overrides: dict, tokenizer: LaTeXTokenizer, device
         # Используем train.py-сигнатуру: SimpleNamespace с теми полями, что
         # читает train_one_epoch.
         train_args = SimpleNamespace(
-            log_every=10**9,           # отключаем step-логи внутри трейла
+            log_every=args.trial_log_every or 10**9,
             limit_batches=args.limit_batches,
         )
 
-        best_metric = float("inf") if metric_name == "val_loss" else -float("inf")
+        # Обе ветки ниже минимизируют (val_em идёт как -val_em), поэтому +inf в обоих случаях.
+        best_metric = float("inf")
         for epoch in range(args.epochs):
             t0 = time.time()
             apply_curriculum(config, train_loader, stage=1,
@@ -154,8 +161,9 @@ def make_objective(args, base_overrides: dict, tokenizer: LaTeXTokenizer, device
             val_loss, val_acc, val_em = validate(
                 model, val_loader, criterion, tokenizer, device,
                 use_amp=use_amp, amp_dtype=amp_dtype,
-                n_em_batches=1,
+                n_em_batches=10,   # 10 батчей ~120 примеров — достаточно для EM-сигнала
                 limit_batches=args.val_limit_batches,
+                greedy_max_len=config.beam_max_len,
             )
             dt = time.time() - t0
 
@@ -206,15 +214,14 @@ def _save_results(study: optuna.Study, args, output_path: str) -> None:
         # train.py CLI поддерживает напрямую — остальные пойдут через config.
         cmd = (
             f"python train.py --profile {args.profile} "
-            f"--lr {best.params['learning_rate']:.6g} "
-            f"--warmup-steps {best.params['warmup_steps']}"
+            f"--lr {best.params['learning_rate']:.6g}"
         )
         best_block = {
             "number":      best.number,
             "value":       best.value,
             "params":      best.params,
             "train_cmd":   cmd,
-            "note":        "weight_decay, dropout, label_smoothing — пропиши в config.py вручную или передай через load_config(**overrides)",
+            "note":        "weight_decay, dropout, label_smoothing — пропиши в config.py вручную или передай в train.py через --weight-decay/--dropout/--label-smoothing",
         }
     else:
         best_block = None
@@ -247,18 +254,18 @@ def _save_results(study: optuna.Study, args, output_path: str) -> None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", default="rtx4060_8gb")
-    parser.add_argument("--n-trials", type=int, default=30,
-                        help="Сколько трейлов. Optuna TPE с ~25-30 трейлов даёт "
-                             "разумный signal на 3-параметрическом поиске.")
-    parser.add_argument("--epochs", type=int, default=4,
-                        help="Эпох в одном трейле. 4 эпохи покрывают warmup и "
-                             "несколько шагов после — разница между конфигами видна.")
-    parser.add_argument("--limit-batches", type=int, default=300,
-                        help="Сколько train-батчей в одном трейле. "
-                             "Default 300 * batch_size = ~5k формул/эпоху.")
-    parser.add_argument("--val-limit-batches", type=int, default=20,
-                        help="Сколько val-батчей. Default 20 = ~320 формул, "
-                             "ранг val_loss консервативен.")
+    parser.add_argument("--n-trials", type=int, default=16,
+                        help="Сколько трейлов")
+    parser.add_argument("--epochs", type=int, default=6,
+                        help="Эпох в одном трейле на полном датасете. 6 эпох: "
+                             "warmup завершается к концу epoch 1, далее 5 эпох "
+                             "при рабочем LR — достаточно чтобы плохие конфиги "
+                             "разошлись и были убиты pruner'ом.")
+    parser.add_argument("--limit-batches", type=int, default=None,
+                        help="Ограничить train-батчи (только для smoke-тестов). "
+                             "По умолчанию — полный датасет.")
+    parser.add_argument("--val-limit-batches", type=int, default=None,
+                        help="Ограничить val-батчи. По умолчанию — полная val.")
     parser.add_argument("--tokenizer", default="data_cache/tokenizer.json")
     parser.add_argument("--study-name", default="latex-ocr-stage1")
     parser.add_argument("--storage", default=None,
@@ -269,6 +276,9 @@ def main():
                         help="Что оптимизировать (val_em максимизируется через -val_em)")
     parser.add_argument("--timeout", type=int, default=None,
                         help="Максимум секунд на study (для CI/ночных прогонов)")
+    parser.add_argument("--trial-log-every", type=int, default=1000,
+                        help="Печатать step-лог внутри трейла раз в N батчей. "
+                             "0 = отключить. По умолчанию 1000 (~7 строк/эпоху).")
 
     # Standard overrides (как в train.py)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -293,8 +303,8 @@ def main():
     print(f"Vocab size: {tokenizer.vocab_size}")
 
     pruner = optuna.pruners.MedianPruner(
-        n_startup_trials=5,
-        n_warmup_steps=1,
+        n_startup_trials=3,   # первые 3 трейла не прунятся — строим статистику
+        n_warmup_steps=1,     # минимум 2 эпохи до прунинга (warmup_steps=1 → прун с epoch 2)
     )
     sampler = optuna.samplers.TPESampler(seed=args.seed)
 

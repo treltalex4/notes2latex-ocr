@@ -101,24 +101,38 @@ def make_lr_scheduler(optimizer, warmup_steps: int, total_steps: int):
 
 
 @torch.no_grad()
-def greedy_decode_batch(model, images, src_kpm, tokenizer, device, max_len=128):
-    # жадная декодировка батча → list[str].
+def greedy_decode_batch(model, images, src_kpm, tokenizer, device, max_len=600):
+    """Жадный декод с KV-кэшем в self-attn декодера.
+
+    O(T) по compute и памяти на шаг вместо O(T²) — каждый шаг считает Q только
+    для нового токена, K/V для предыдущих позиций берутся из кэша.
+    """
     model.eval()
     B = images.shape[0]
     memory, memory_kpm = model.encoder(images, src_key_padding_mask=src_kpm)
 
-    generated = torch.full((B, 1), SOS_ID, dtype=torch.long, device=device)
+    # Первый шаг: пропускаем SOS через декодер, инициализируем кэш.
+    cur_token = torch.full((B, 1), SOS_ID, dtype=torch.long, device=device)
+    tokens: list[torch.Tensor] = [cur_token]
     finished = torch.zeros(B, dtype=torch.bool, device=device)
+    kv_caches = None
 
-    for _ in range(max_len - 1):
-        logits = model.decoder(generated, memory, memory_key_padding_mask=memory_kpm)
+    for step in range(max_len - 1):
+        logits, kv_caches = model.decoder.forward_step(
+            cur_token, memory,
+            memory_key_padding_mask=memory_kpm,
+            kv_caches=kv_caches,
+            position_offset=step,
+        )
         next_ids = logits[:, -1, :].argmax(dim=-1)
         next_ids = torch.where(finished, torch.full_like(next_ids, PAD_ID), next_ids)
-        generated = torch.cat([generated, next_ids.unsqueeze(1)], dim=1)
+        cur_token = next_ids.unsqueeze(1)
+        tokens.append(cur_token)
         finished = finished | (next_ids == EOS_ID)
         if finished.all():
             break
 
+    generated = torch.cat(tokens, dim=1)
     return [tokenizer.decode(generated[i].tolist()) for i in range(B)]
 
 
@@ -180,7 +194,7 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, criterion, toke
 @torch.no_grad()
 def validate(model, loader, criterion, tokenizer, device,
              use_amp, amp_dtype,
-             n_em_batches=2, limit_batches=None):
+             n_em_batches=2, limit_batches=None, greedy_max_len=600):
     model.eval()
     losses, accs = [], []
     em_predictions, em_references = [], []
@@ -203,7 +217,7 @@ def validate(model, loader, criterion, tokenizer, device,
         accs.append(token_accuracy(logits, tgt_output, pad_idx=PAD_ID))
 
         if batch_idx < n_em_batches:
-            predicted  = greedy_decode_batch(model, images, src_kpm, tokenizer, device)
+            predicted  = greedy_decode_batch(model, images, src_kpm, tokenizer, device, max_len=greedy_max_len)
             references = [tokenizer.decode(ids.tolist()) for ids in tgt_ids]
             em_predictions.extend(predicted)
             em_references.extend(references)
@@ -299,12 +313,23 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
                 use_amp=use_amp, amp_dtype=amp_dtype,
             )
 
+            # Возвращаем зарезервированную память пулом обратно в систему перед
+            # validate — у greedy decode другой профиль аллокаций, и без сброса
+            # PyTorch держит фрагментированный пул, что повышает риск OOM на
+            # длинных val-батчах.
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
             val_loss, val_acc, val_em = validate(
                 model, val_loader, criterion, tokenizer, device,
                 use_amp=use_amp, amp_dtype=amp_dtype,
                 n_em_batches=args.n_em_batches,
                 limit_batches=args.val_limit_batches,
+                greedy_max_len=config.beam_max_len,
             )
+
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
             dt = time.time() - t0
             print(f"\nEpoch {epoch + 1} | "
@@ -544,6 +569,11 @@ def main():
                 stage=stage, stage_name=cfg["name"],
                 epochs=cfg["epochs"], lr_multiplier=cfg["lr_multiplier"],
             )
+
+            # Между стадиями сбрасываем CUDA-пул: новый train_loader, новые
+            # оптимизатор/scheduler — старые тензоры держать незачем.
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
     except KeyboardInterrupt:
         # run_stage уже сохранил interrupt_*.pth и напечатал детали.
         # Здесь просто выходим с кодом 130 (стандарт SIGINT) без traceback.
