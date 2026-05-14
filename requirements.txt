@@ -1,4 +1,5 @@
-torch>=2.6.0
+--index-url https://download.pytorch.org/whl/cu130
+torch==2.10.0+cu130
 torchvision
 numpy
 matplotlib
@@ -19,5 +20,4 @@ jupyter
 ipykernel
 pdf2image
 h5py
-python-doctr[torch]
 imagehash
