@@ -19,6 +19,10 @@ class _CachedDataset(Dataset):
     def __init__(self, entries: list[dict]) -> None:
         self.samples: list[tuple[str, str]] = [(e["npy_path"], e["formula"]) for e in entries]
         self.lengths: list[int] = [e["length"] for e in entries]
+        # Ширина препроцессенной картинки — для вторичной сортировки в
+        # BucketBatchSampler (батчи однородны по ширине → encoder не считает
+        # белый паддинг). 0 если ключа нет — graceful degradation.
+        self.widths: list[int] = [e.get("width", 0) for e in entries]
         # updated by train.py before each epoch
         self.elastic_p: float = 0.0
         self.elastic_alpha: int = 0
@@ -88,6 +92,7 @@ class BucketBatchSampler(Sampler):
         self.base_batch_size = base_batch_size
         self.shuffle = shuffle
         self.lengths = dataset.lengths
+        self.widths = dataset.widths
         self.current_max_length: int = dataset.max_length  # updated by train.py each epoch
 
     def _get_dynamic_batch_size(self, max_len: int) -> int:
@@ -102,11 +107,27 @@ class BucketBatchSampler(Sampler):
     def _generate_batches(self) -> list[list[int]]:
         indices = [i for i in range(len(self.dataset)) if self.lengths[i] <= self.current_max_length]
 
+        # Двухуровневая сортировка:
+        #   primary   — длина формулы, квантованная в бакеты по LEN_BUCKET
+        #               токенов (внутри бакета длины "одинаковы" для целей
+        #               паддинга токенов — сохраняет старое поведение).
+        #   secondary — ширина картинки: батч получается однородным по ширине,
+        #               collate паддит до близкого max_w, encoder/CNN не тратят
+        #               compute на белый паддинг.
+        # Шум на обоих уровнях сохраняет перемешивание батчей между эпохами.
+        LEN_BUCKET = 32
         if self.shuffle:
-            noisy = {i: self.lengths[i] + random.uniform(-20, 20) for i in indices}
-            indices.sort(key=lambda i: noisy[i])
+            keyed = {
+                i: (
+                    int((self.lengths[i] + random.uniform(-16, 16)) // LEN_BUCKET),
+                    self.widths[i] + random.uniform(-30, 30),
+                )
+                for i in indices
+            }
+            indices.sort(key=lambda i: keyed[i])
         else:
-            indices.sort(key=lambda i: self.lengths[i])
+            # Детерминированно: длина, затем ширина.
+            indices.sort(key=lambda i: (self.lengths[i], self.widths[i]))
 
         batches: list[list[int]] = []
         current_batch: list[int] = []

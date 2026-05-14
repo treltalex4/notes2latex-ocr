@@ -13,7 +13,7 @@ class Config:
     num_encoder_layers: int = 4
     num_decoder_layers: int = 4
     dim_feedforward: int = 1024
-    dropout: float = 0.12
+    dropout: float = 0.11
     max_seq_len: int = 1024         # верхний предел для PE encoder'а (mem_len = max_width/4)
     use_rope: bool = True           # RoPE в декодере вместо learnable PE
 
@@ -26,9 +26,9 @@ class Config:
     batch_size: int = 12            # снижено с 16 → запас VRAM на широкие картинки
     grad_accum_steps: int = 2       # effective bs = 24 (lr=1e-3 валидирован при bs=32, разница 25% — терпимо)
     grad_clip_norm: float = 0.98
-    learning_rate: float = 3e-4
+    learning_rate: float = 2e-4
     weight_decay: float = 0.0003
-    label_smoothing: float = 0.055    # CE label smoothing; 0.05–0.1 — типично для seq2seq
+    label_smoothing: float = 0.02    # CE label smoothing; 0.05–0.1 — типично для seq2seq
     epochs_pretrain: int = 40       # этап 1: формулы (im2latex)
     epochs_mixed: int = 40          # этап 2: формулы + синтетика
     epochs_finetune: int = 20       # этап 3: свой датасет (с replay synthetic)
@@ -45,7 +45,7 @@ class Config:
 
     # ===== Data Loading =====
     num_workers: int = 6
-    prefetch_factor: int = 2
+    prefetch_factor: int = 4
 
     # ===== Datasets =====
     datasets_stage1: list = field(default_factory=lambda: ["im2latex"])

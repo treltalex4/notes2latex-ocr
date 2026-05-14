@@ -46,6 +46,48 @@ def _save_history(history: dict, path: str) -> None:
     os.replace(tmp, path)
 
 
+_STAGE_NAMES = {1: "pretrain", 2: "mixed"}
+
+
+def _make_checkpoint(stage, stage_name, epoch, model, optimizer, scheduler, scaler,
+                     best_val_loss, epochs_no_improve, history_path, vocab_size,
+                     val_loss, val_acc, val_em, interrupted=False) -> dict:
+    """Полный снимок состояния для resume — сохраняется в best/last/interrupt.
+
+    `epoch`: для last/best это завершённая эпоха (resume стартует с epoch+1),
+    для interrupt — эпоха в процессе (resume перезапускает её целиком).
+    """
+    return {
+        "stage": stage,
+        "stage_name": stage_name,
+        "epoch": epoch,
+        "interrupted": interrupted,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "best_val_loss": best_val_loss,
+        "epochs_no_improve": epochs_no_improve,
+        "history_path": history_path,
+        "val_loss": val_loss,
+        "val_acc": val_acc,
+        "val_em": val_em,
+        "vocab_size": vocab_size,
+    }
+
+
+def _resolve_resume_path(args, config) -> str | None:
+    """Резолвит чекпоинт для resume: явный --resume-from приоритетнее, иначе
+    --resume-mode подставляет checkpoints/<mode>_<stage>.pth для первой
+    стадии из --stages."""
+    if args.resume_from:
+        return args.resume_from
+    if args.resume_mode:
+        stage_name = _STAGE_NAMES[args.stages[0]]
+        return os.path.join(config.checkpoint_dir, f"{args.resume_mode}_{stage_name}.pth")
+    return None
+
+
 def _train_datasets(loader):
     """Возвращает список tail-датасетов вне зависимости от того, обернул
     DataLoader Im2LatexDataset напрямую или через ConcatDataset (stage 2/3)."""
@@ -142,8 +184,17 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, criterion, toke
     model.train()
     losses, accs = [], []
 
+    # Профайлер data-loader bottleneck: data_wait — время, проведённое в
+    # ожидании следующего батча от воркеров (если велико → loader не успевает
+    # за GPU). compute — время forward+backward+step. Печатается в конце эпохи.
+    data_wait, compute = 0.0, 0.0
+    t_mark = time.time()
+
     optimizer.zero_grad()
     for batch_idx, (images, src_kpm, tgt_ids) in enumerate(loader):
+        data_wait += time.time() - t_mark
+        t_compute = time.time()
+
         images  = images.to(device)
         src_kpm = src_kpm.to(device)
         tgt_ids = tgt_ids.to(device)
@@ -185,8 +236,17 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, criterion, toke
             print(f"  step {batch_idx:4d} | loss={losses[-1]:.4f} | "
                   f"acc={accs[-1]:.3f} | lr={current_lr:.2e}")
 
+        compute += time.time() - t_compute
+
         if limit_batches and batch_idx + 1 >= limit_batches:
             break
+
+        t_mark = time.time()
+
+    total = data_wait + compute
+    if total > 0:
+        print(f"  [profile] data_wait={data_wait:.1f}s compute={compute:.1f}s "
+              f"→ {100 * data_wait / total:.0f}% waiting on data loader")
 
     return sum(losses) / len(losses), sum(accs) / len(accs)
 
@@ -230,8 +290,14 @@ def validate(model, loader, criterion, tokenizer, device,
 
 
 def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype,
-              stage: int, stage_name: str, epochs: int, lr_multiplier: float = 1.0):
-    """Один этап обучения. Возвращает путь к лучшему чекпоинту."""
+              stage: int, stage_name: str, epochs: int, lr_multiplier: float = 1.0,
+              resume_state: dict | None = None):
+    """Один этап обучения. Возвращает путь к лучшему чекпоинту.
+
+    resume_state — снимок из _make_checkpoint для продолжения этой стадии:
+    восстанавливает optimizer/scheduler/scaler, счётчики early stopping и
+    дописывает в тот же history-файл.
+    """
     print(f"\n{'=' * 60}")
     print(f"  STAGE {stage}: {stage_name}  ({epochs} epochs, lr×{lr_multiplier})")
     print(f"{'=' * 60}")
@@ -251,6 +317,9 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
     if args.limit_batches:
         batches_per_epoch = min(batches_per_epoch, args.limit_batches)
     steps_per_epoch = batches_per_epoch // accum_steps
+    # total_steps считается по ПОЛНОМУ числу эпох — при resume scheduler_state
+    # восстанавливает позицию, а форма косинуса должна совпадать с оригиналом.
+    # Поэтому --epochs-stage* при resume должен быть тем же, что в первом запуске.
     total_steps = max(1, steps_per_epoch * epochs)
     warmup = args.warmup_steps if args.warmup_steps is not None else config.warmup_steps
     scheduler = make_lr_scheduler(optimizer, warmup, total_steps)
@@ -259,43 +328,76 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
           f"lr_base={base_lr:.2e})")
 
     ckpt_path = os.path.join(config.checkpoint_dir, f"best_{stage_name}.pth")
+    last_path = os.path.join(config.checkpoint_dir, f"last_{stage_name}.pth")
 
-    # Per-run JSON — отдельный файл на каждый эксперимент. Имя берётся из
-    # args.run_name либо генерируется автоматически. Старые прогоны не
-    # теряются — каждый пишется в свой файл в runs/.
-    run_name = args.run_name or _auto_run_name(args, config, base_lr, stage_name)
-    runs_dir = os.path.join(config.checkpoint_dir, "runs")
-    os.makedirs(runs_dir, exist_ok=True)
-    history_path = os.path.join(runs_dir, f"{run_name}.json")
+    # --- Resume: optimizer/scheduler/scaler + счётчики early stopping ---
+    full_resume = resume_state is not None and "optimizer_state_dict" in resume_state
+    if full_resume:
+        optimizer.load_state_dict(resume_state["optimizer_state_dict"])
+        scheduler.load_state_dict(resume_state["scheduler_state_dict"])
+        if resume_state.get("scaler_state_dict") is not None:
+            scaler.load_state_dict(resume_state["scaler_state_dict"])
+        best_val_loss     = resume_state.get("best_val_loss", float("inf"))
+        epochs_no_improve = resume_state.get("epochs_no_improve", 0)
+        # interrupt сохранён посреди эпохи → перезапускаем её целиком.
+        # last/best сохранены на границе эпохи → стартуем со следующей.
+        start_epoch = (resume_state["epoch"] if resume_state.get("interrupted")
+                       else resume_state["epoch"] + 1)
+        print(f"  RESUME: start_epoch={start_epoch + 1}/{epochs} "
+              f"best_val_loss={best_val_loss:.4f} epochs_no_improve={epochs_no_improve}")
+    else:
+        if resume_state is not None:
+            print("  WARNING: чекпоинт без optimizer_state — weights-only resume, "
+                  "обучение стартует с epoch 1")
+        best_val_loss     = float("inf")
+        epochs_no_improve = 0
+        start_epoch       = 0
+
+    # --- History: дописываем существующий файл при resume, иначе создаём новый ---
+    resume_history = resume_state.get("history_path") if full_resume else None
+    if resume_history and os.path.exists(resume_history):
+        history_path = resume_history
+        with open(history_path, encoding="utf-8") as f:
+            history = json.load(f)
+        run_name = history["run_name"]
+        # Отбрасываем записи эпох >= start_epoch (interrupt мог перезаписать эпоху).
+        history["epochs"] = [e for e in history["epochs"] if e["epoch"] < start_epoch]
+        history.pop("interrupted", None)
+        history.setdefault("resumes", []).append(time.strftime("%Y-%m-%dT%H:%M:%S"))
+    else:
+        # Per-run JSON — отдельный файл на каждый эксперимент. Имя берётся из
+        # args.run_name либо генерируется автоматически. Старые прогоны не
+        # теряются — каждый пишется в свой файл в runs/.
+        run_name = args.run_name or _auto_run_name(args, config, base_lr, stage_name)
+        runs_dir = os.path.join(config.checkpoint_dir, "runs")
+        os.makedirs(runs_dir, exist_ok=True)
+        history_path = os.path.join(runs_dir, f"{run_name}.json")
+        history = {
+            "run_name":   run_name,
+            "stage":      stage,
+            "stage_name": stage_name,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "hyperparams": {
+                "lr":              base_lr,
+                "weight_decay":    config.weight_decay,
+                "dropout":         config.dropout,
+                "label_smoothing": config.label_smoothing,
+                "batch_size":      config.batch_size,
+                "grad_accum":      config.grad_accum_steps,
+                "warmup_steps":    warmup,
+                "limit_batches":   args.limit_batches,
+                "epochs":          epochs,
+                "seed":            args.seed,
+            },
+            "epochs": [],
+        }
     print(f"Run name:  {run_name}")
     print(f"Logging:   {history_path}")
 
-    history = {
-        "run_name":   run_name,
-        "stage":      stage,
-        "stage_name": stage_name,
-        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-        "hyperparams": {
-            "lr":              base_lr,
-            "weight_decay":    config.weight_decay,
-            "dropout":         config.dropout,
-            "label_smoothing": config.label_smoothing,
-            "batch_size":      config.batch_size,
-            "grad_accum":      config.grad_accum_steps,
-            "warmup_steps":    warmup,
-            "limit_batches":   args.limit_batches,
-            "epochs":          epochs,
-            "seed":            args.seed,
-        },
-        "epochs": [],
-    }
-
-    best_val_loss = float("inf")
-    epochs_no_improve = 0
-    epoch = 0   # safety: если Ctrl+C попал до первой итерации
+    epoch = start_epoch   # safety: если Ctrl+C попал до первой итерации
 
     try:
-        for epoch in range(epochs):
+        for epoch in range(start_epoch, epochs):
             t0 = time.time()
             print(f"\n=== Epoch {epoch + 1}/{epochs} (stage {stage}: {stage_name}) ===")
 
@@ -350,25 +452,29 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
             })
             _save_history(history, history_path)
 
-            if val_loss < best_val_loss:
+            # Счётчик early stopping обновляем ДО сохранения чекпоинтов,
+            # чтобы last_*.pth нёс актуальный epochs_no_improve.
+            is_best = val_loss < best_val_loss
+            if is_best:
                 best_val_loss = val_loss
                 epochs_no_improve = 0
-                torch.save({
-                    "stage": stage,
-                    "stage_name": stage_name,
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "scheduler_state_dict": scheduler.state_dict(),
-                    "val_loss": val_loss,
-                    "val_acc": val_acc,
-                    "val_em": val_em,
-                    "vocab_size": tokenizer.vocab_size,
-                }, ckpt_path)
-                print(f"  → saved best to {ckpt_path}")
             else:
                 epochs_no_improve += 1
-                print(f"  no improvement for {epochs_no_improve}/{config.patience} epochs "
+
+            ckpt = _make_checkpoint(
+                stage, stage_name, epoch, model, optimizer, scheduler, scaler,
+                best_val_loss, epochs_no_improve, history_path, tokenizer.vocab_size,
+                val_loss, val_acc, val_em, interrupted=False,
+            )
+            # last_*.pth — каждую эпоху на границе. Чистая точка resume "продолжить".
+            torch.save(ckpt, last_path)
+
+            if is_best:
+                torch.save(ckpt, ckpt_path)
+                print(f"  → saved best to {ckpt_path}  (last → {last_path})")
+            else:
+                print(f"  saved last → {last_path}  | "
+                      f"no improvement {epochs_no_improve}/{config.patience} "
                       f"(best val_loss={best_val_loss:.4f})")
                 if epochs_no_improve >= config.patience:
                     print(f"\nEarly stopping: val_loss не улучшался {config.patience} эпох. "
@@ -377,20 +483,22 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
     except KeyboardInterrupt:
         # Graceful shutdown: сохраняем текущее состояние (НЕ best_*.pth, чтобы
         # не затереть лучший чекпоинт) и пробрасываем исключение наверх.
+        # interrupted=True → resume перезапустит эту эпоху целиком (scheduler
+        # уйдёт чуть вперёд на доделанные шаги — допустимый дрейф для аварийной точки).
+        # val_* = nan: Ctrl+C мог прийти до validate этой эпохи.
         interrupt_path = os.path.join(config.checkpoint_dir, f"interrupt_{stage_name}.pth")
-        torch.save({
-            "stage": stage,
-            "stage_name": stage_name,
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "scheduler_state_dict": scheduler.state_dict(),
-            "vocab_size": tokenizer.vocab_size,
-            "interrupted": True,
-        }, interrupt_path)
+        torch.save(
+            _make_checkpoint(
+                stage, stage_name, epoch, model, optimizer, scheduler, scaler,
+                best_val_loss, epochs_no_improve, history_path, tokenizer.vocab_size,
+                float("nan"), float("nan"), float("nan"), interrupted=True,
+            ),
+            interrupt_path,
+        )
         print(f"\n[INTERRUPT] caught at epoch {epoch + 1}/{epochs}")
         print(f"  saved interrupt state -> {interrupt_path}")
         print(f"  best so far          -> {ckpt_path} (val_loss={best_val_loss:.4f})")
+        print(f"  resume:  python train.py --resume-mode interrupt --stages {stage}")
         # Финализируем history даже при прерывании — данные не теряются.
         history["interrupted"] = True
         _finalize_history(history, history_path)
@@ -465,7 +573,16 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=None,
                         help="override config.warmup_steps (useful for debug runs)")
     parser.add_argument("--resume-from", default=None,
-                        help="путь к чекпоинту для загрузки перед запуском этапов")
+                        help="Путь к чекпоинту для полного resume (model + optimizer + "
+                             "scheduler + scaler + счётчики early stopping). "
+                             "Приоритетнее --resume-mode.")
+    parser.add_argument("--resume-mode", choices=["last", "best", "interrupt"], default=None,
+                        help="Shortcut вместо --resume-from: берёт "
+                             "checkpoints/<mode>_<stage>.pth для первой стадии из --stages. "
+                             "last=продолжить с границы эпохи; best=откатиться к лучшей "
+                             "(обычно вместе со сменой гиперов, иначе воспроизведётся та же "
+                             "траектория); interrupt=аварийная точка, перезапускает "
+                             "прерванную эпоху.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Override config.seed. None в config = random.")
     parser.add_argument("--run-name", default=None,
@@ -523,10 +640,19 @@ def main():
     model = Notes2LaTeX(config, tokenizer.vocab_size).to(device)
     print(f"Параметров: {count_parameters(model):,}")
 
-    if args.resume_from:
-        state = torch.load(args.resume_from, map_location=device)
-        model.load_state_dict(state["model_state_dict"])
-        print(f"Resumed model from {args.resume_from}")
+    resume_path = _resolve_resume_path(args, config)
+    resume_state = None
+    if resume_path is not None:
+        if not os.path.exists(resume_path):
+            print(f"ERROR: resume-чекпоинт не найден: {resume_path}")
+            sys.exit(1)
+        resume_state = torch.load(resume_path, map_location=device)
+        model.load_state_dict(resume_state["model_state_dict"])
+        kind = "interrupt (mid-epoch)" if resume_state.get("interrupted") else "epoch-boundary"
+        bvl = resume_state.get("best_val_loss")
+        print(f"Resume: {resume_path}")
+        print(f"  stage={resume_state.get('stage')} epoch={resume_state.get('epoch')} "
+              f"[{kind}]" + (f" best_val_loss={bvl:.4f}" if bvl is not None else ""))
 
     # AMP setup общий для всех стадий.
     amp_dtype = torch.bfloat16 if config.amp_dtype == "bfloat16" else torch.float16
@@ -556,9 +682,21 @@ def main():
     try:
         for stage in args.stages:
             cfg = stage_configs[stage]
+
+            # Resume применяется только к стадии, на которой прервались.
+            stage_resume = None
+            if resume_state is not None:
+                rs_stage = resume_state.get("stage")
+                if rs_stage == stage:
+                    stage_resume = resume_state
+                elif rs_stage is not None and stage < rs_stage:
+                    print(f"\nStage {stage} завершён до прерывания — пропускаем")
+                    continue
+
             # Между стадиями: загружаем лучший чекпоинт предыдущей в модель,
             # чтобы стартовать с best, а не с последнего epoch state.
-            if last_ckpt is not None:
+            # Пропускаем, если резюмим саму эту стадию (веса уже загружены).
+            if last_ckpt is not None and stage_resume is None:
                 state = torch.load(last_ckpt, map_location=device)
                 model.load_state_dict(state["model_state_dict"])
                 print(f"\nLoaded best from previous stage: {last_ckpt}")
@@ -568,7 +706,9 @@ def main():
                 scaler, use_amp, amp_dtype,
                 stage=stage, stage_name=cfg["name"],
                 epochs=cfg["epochs"], lr_multiplier=cfg["lr_multiplier"],
+                resume_state=stage_resume,
             )
+            resume_state = None  # consumed
 
             # Между стадиями сбрасываем CUDA-пул: новый train_loader, новые
             # оптимизатор/scheduler — старые тензоры держать незачем.
