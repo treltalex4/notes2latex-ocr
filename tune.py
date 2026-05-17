@@ -443,11 +443,9 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-width", type=int, default=None)
-    parser.add_argument("--use-compile", action=argparse.BooleanOptionalAction, default=False,
-                        help="torch.compile внутри трейлов. Дефолт False: dynamic shapes "
-                             "BucketBatchSampler конфликтуют с Inductor lowering "
-                             "adaptive_avg_pool2d. Для tune compile не нужен (важна "
-                             "сравнимость трейлов, не максимум throughput).")
+    parser.add_argument("--use-compile", action=argparse.BooleanOptionalAction, default=None,
+                        help="Override config.use_compile. Дефолт — config (True). "
+                             "Используй --no-use-compile на Windows.")
 
     args = parser.parse_args()
 

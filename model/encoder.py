@@ -38,6 +38,16 @@ class SinusoidalPE(nn.Module):
 
 
 
+class _HeightMean(nn.Module):
+    """Эквивалент nn.AdaptiveAvgPool2d((1, None)) — среднее по H, ширина
+    сохраняется. Используем mean вместо AdaptiveAvgPool2d, потому что
+    последний с символической шириной ломает torch.compile (Inductor
+    lowering пытается решить window_size > 25 на symbolic expressions
+    и падает с TypeError на Relational)."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x.mean(dim=2, keepdim=True)
+
+
 class HybridEncoder(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
@@ -63,7 +73,7 @@ class HybridEncoder(nn.Module):
             out_ch = channels[i + 1]
             pool = pool_kernels[i]
             blocks.append(_make_block(in_ch, out_ch, pool))
-        blocks.append(nn.AdaptiveAvgPool2d((1, None)))
+        blocks.append(_HeightMean())
 
         self.cnn = nn.Sequential(*blocks)
         self.pe = SinusoidalPE(config.d_model, max_len=config.max_seq_len)
