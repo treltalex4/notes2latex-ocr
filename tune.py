@@ -1,32 +1,35 @@
 """Optuna-based hyperparameter search для stage 1 (im2latex pretrain).
 
-Запускает N трейлов на ПОЛНОМ датасете (без --limit-batches).
-Минимизирует композитный objective (--metric composite, по умолчанию):
-устойчивый хвост val_loss + штраф за откат (rebound) + штраф за разрыв
-train/val − бонус за val_em. Подробности — в _compute_objective ниже.
-MedianPruner + явный divergence-prune убивают плохие трейлы досрочно.
+Подбирает 6 гиперпараметров (lr, wd, dropout, label_smoothing, warmup_steps,
+grad_clip_norm) на ПОЛНОМ датасете. Минимизирует композитный objective
+(--metric composite, по умолчанию): устойчивый хвост val_loss + штраф за
+откат (rebound) + штраф за разрыв train/val − бонус за val_em. Подробности
+— в _compute_objective ниже. MedianPruner + явный divergence-prune убивают
+плохие трейлы досрочно.
 
 Использование:
-    # РЕКОМЕНДУЕТСЯ для будущего 40-эпохового прогона: scheduler думает что
-    # горизонт 40, реально гоняем 8 трейл-эпох. LR-режим в трейле = LR-режим
-    # первых 8 эпох real-run'а (warmup + удержание около пика). Без флага
-    # scheduler сожмёт decay в trial-эпохи и финдинг будет смещён к слишком
-    # высоким LR (как было в lr_search_v3).
-    python tune.py --schedule-epochs 40 --epochs 8 --study-name lr_for_40ep
+    # Полный большой tune (дефолт): 100 трейлов × 18 эпох, schedule_epochs=40.
+    # Параметры найденные тут напрямую переносятся в 40-эпохный train.py:
+    #  - lr подобран под cosine с горизонтом 40 эпох (schedule_epochs trick)
+    #  - warmup_steps в АБСОЛЮТНЫХ шагах — одно значение в трейле и реале
+    #  - curriculum в трейле привязан к schedule_epochs (см. apply_curriculum
+    #    в objective) → переходы на тех же эпохах что и в реальном прогоне
+    #  - остальные параметры horizon-independent
+    python tune.py --schedule-epochs 40 --study-name big_tune_5090_v1 \\
+                   --storage sqlite:///optuna_big.db
 
-    # С указанием study name (для resume после прерывания)
-    python tune.py --study-name lr_search_v2 --storage sqlite:///optuna.db
+    # Resume после прерывания (SQLite сохраняет state)
+    python tune.py --study-name big_tune_5090_v1 --storage sqlite:///optuna_big.db
 
-    # Быстрый smoke-тест (не для реального поиска)
-    python tune.py --n-trials 2 --epochs 1 --limit-batches 50
+    # Быстрый smoke-тест
+    python tune.py --n-trials 2 --epochs 2 --limit-batches 50
 
-Важно: только learning_rate horizon-dependent (через cosine schedule).
-weight_decay/dropout/label_smoothing применяются per-step и одинаковы.
-Curriculum/elastic/strength остаются сжатыми в args.epochs — иначе
-трейл не увидит длинных формул и не проверит LR против сложных данных.
+Кросс-платформенность: tune использует --profile rtx4060_8gb (батч и архитектура
+ноутбука) → найденные параметры подходят и для облака (RTX 5090) и для ноутбука.
+На Linux включить torch.compile в config или через --use-compile в train.py.
 
 Результаты пишутся в --output (по умолчанию checkpoints/tune_results.json):
-лучший трейл, топ-5, search space, готовая CLI-команда для train.py.
+лучший трейл с готовой CLI-командой для train.py (все 6 параметров).
 """
 
 from __future__ import annotations
@@ -56,27 +59,30 @@ from train import (
 )
 
 
-# Search space расширен для полного датасета. Прошлые ручные прогоны делались
-# на limit_batches и искажали верх диапазона LR — на полном датасете и bf16
-# модель потенциально стабильна и при более высоких LR. Pruner отсечёт плохое.
+# Search space для большого tune на полном датасете и длинных трейлах (15-20 эпох).
+# Расширен по результатам ручных прогонов: warmup_steps и grad_clip_norm
+# критически влияли на стабильность через curriculum-переходы (epoch 6, 12)
+# — они теперь в search вместо ручного подбора.
 # Что НЕ в search:
-#   warmup_steps: адаптируется к длине трейла автоматически (см. ниже).
 #   batch_size / grad_accum_steps: упираются в VRAM, инженерный параметр.
-#   grad_clip_norm: safety mechanism, на bf16 в стабильной зоне не двигает loss.
 SEARCH_SPACE = {
-    "learning_rate":   {"low": 5e-5,  "high": 1e-3,  "log": True},
-    "weight_decay":    {"low": 1e-4,  "high": 1e-1,  "log": True},
-    "dropout":         {"low": 0.05,  "high": 0.30,  "log": False},
-    "label_smoothing": {"low": 0.0,   "high": 0.15,  "log": False},
+    "learning_rate":   {"low": 3e-5,  "high": 1.5e-3, "log": True},
+    "weight_decay":    {"low": 1e-5,  "high": 1e-1,   "log": True},
+    "dropout":         {"low": 0.05,  "high": 0.40,   "log": False},
+    "label_smoothing": {"low": 0.0,   "high": 0.15,   "log": False},
+    "warmup_steps":    {"low": 1500,  "high": 20000,  "log": True},
+    "grad_clip_norm":  {"low": 0.3,   "high": 2.0,    "log": True},
 }
 
 
 def _sample_params(trial: optuna.Trial) -> dict[str, Any]:
     return {
-        "learning_rate":   trial.suggest_float("learning_rate",   5e-5, 1e-3, log=True),
-        "weight_decay":    trial.suggest_float("weight_decay",    1e-4, 1e-1, log=True),
-        "dropout":         trial.suggest_float("dropout",         0.05, 0.30),
+        "learning_rate":   trial.suggest_float("learning_rate",   3e-5, 1.5e-3, log=True),
+        "weight_decay":    trial.suggest_float("weight_decay",    1e-5, 1e-1,   log=True),
+        "dropout":         trial.suggest_float("dropout",         0.05, 0.40),
         "label_smoothing": trial.suggest_float("label_smoothing", 0.0,  0.15),
+        "warmup_steps":    trial.suggest_int(  "warmup_steps",    1500, 20000,  log=True),
+        "grad_clip_norm":  trial.suggest_float("grad_clip_norm",  0.3,  2.0,    log=True),
     }
 
 
@@ -235,10 +241,17 @@ def make_objective(args, base_overrides: dict, tokenizer: LaTeXTokenizer, device
         val_ems:      list[float] = []
         val_accs:     list[float] = []
 
+        # КРИТИЧНО для трансфера параметров: curriculum привязан к schedule_epochs
+        # (горизонту реального прогона), не к args.epochs трейла. Иначе трейл
+        # видит curriculum-переходы в other absolute эпохах чем реальный прогон,
+        # и параметры найденные на сжатом curriculum плохо переносятся на 40 эпох.
+        # При schedule_epochs=40, epochs=18 — трейл проживает первые 18 эпох
+        # реального прогона: max_length 200 (1-6) → 280 (7-11) → 350 (12-18).
+        curriculum_total = schedule_epochs
         for epoch in range(args.epochs):
             t0 = time.time()
             apply_curriculum(config, train_loader, stage=1,
-                             epoch=epoch, total_epochs=args.epochs)
+                             epoch=epoch, total_epochs=curriculum_total)
 
             train_loss, train_acc = train_one_epoch(
                 model, train_loader, optimizer, scheduler, scaler,
@@ -334,18 +347,25 @@ def _save_results(study: optuna.Study, args, output_path: str) -> None:
 
     if completed:
         best = study.best_trial
-        # Готовая команда для train.py с лучшими гиперами. Только те, что
-        # train.py CLI поддерживает напрямую — остальные пойдут через config.
+        # Готовая команда для train.py: ВСЕ 6 гиперпараметров через CLI.
+        # train.py теперь принимает все шесть через флаги, не нужно править config.
+        p = best.params
         cmd = (
-            f"python train.py --profile {args.profile} "
-            f"--lr {best.params['learning_rate']:.6g}"
+            f"python train.py --profile {args.profile}"
+            f" --lr {p['learning_rate']:.6g}"
+            f" --weight-decay {p['weight_decay']:.6g}"
+            f" --dropout {p['dropout']:.4g}"
+            f" --label-smoothing {p['label_smoothing']:.4g}"
+            f" --warmup-steps {int(p['warmup_steps'])}"
+            f" --grad-clip-norm {p['grad_clip_norm']:.4g}"
         )
         best_block = {
             "number":      best.number,
             "value":       best.value,
             "params":      best.params,
             "train_cmd":   cmd,
-            "note":        "weight_decay, dropout, label_smoothing — пропиши в config.py вручную или передай в train.py через --weight-decay/--dropout/--label-smoothing",
+            "note":        "На Linux/сервере добавь --use-compile --compile-mode max-autotune. "
+                           "На Windows/ноутбуке — --no-use-compile (или дефолт config).",
         }
     else:
         best_block = None
@@ -363,6 +383,8 @@ def _save_results(study: optuna.Study, args, output_path: str) -> None:
         "settings": {
             "profile":           args.profile,
             "epochs_per_trial":  args.epochs,
+            "schedule_epochs":   args.schedule_epochs,
+            "n_em_batches":      args.n_em_batches,
             "limit_batches":     args.limit_batches,
             "val_limit_batches": args.val_limit_batches,
             "seed":              args.seed,
@@ -378,22 +400,22 @@ def _save_results(study: optuna.Study, args, output_path: str) -> None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", default="rtx4060_8gb")
-    parser.add_argument("--n-trials", type=int, default=16,
-                        help="Сколько трейлов")
-    parser.add_argument("--epochs", type=int, default=8,
-                        help="Эпох в одном трейле на полном датасете. 8 эпох: "
-                             "warmup ~2 эпохи (при schedule-epochs=40, warmup=7000), "
-                             "далее 6 эпох при рабочем LR — достаточно для "
-                             "discrimination между конфигами + есть запас "
-                             "перед divergence-prune (DIVERGENCE_WARMUP_EPOCHS=3).")
+    parser.add_argument("--n-trials", type=int, default=100,
+                        help="Сколько трейлов. 6 dims в search → 100 для уверенной "
+                             "сходимости TPE и низкой вероятности что top-5 — везение. "
+                             "На RTX 5090 с compile ~60-70ч с pruning.")
+    parser.add_argument("--epochs", type=int, default=18,
+                        help="Эпох в одном трейле. 18 эпох при schedule-epochs=40 "
+                             "покрывают оба curriculum-перехода (200→280 на epoch 6, "
+                             "280→350 на epoch 12) — критично для отсева LR, "
+                             "которые ломаются на сложных данных. 15 минимум, "
+                             "20 даёт чуть больше хвоста на max_length=350.")
     parser.add_argument("--schedule-epochs", type=int, default=40,
                         help="Горизонт LR-scheduler в эпохах")
-    parser.add_argument("--n-em-batches", type=int, default=30,
+    parser.add_argument("--n-em-batches", type=int, default=60,
                         help="Сколько val-батчей идёт в EM-метрику внутри трейла. "
-                             "Старый дефолт 10 (~120 примеров) был в зоне шума. "
-                             "30 (~360 примеров) выводит EM из шума при минимальном "
-                             "оверхеде. Поднимать выше 50 не нужно — greedy decode "
-                             "становится узким горлышком.")
+                             "60 (~720 примеров) даёт уверенный EM-сигнал на 18-эпохных "
+                             "трейлах. На RTX 5090 с compile оверхед минимален.")
     parser.add_argument("--limit-batches", type=int, default=None,
                         help="Ограничить train-батчи (только для smoke-тестов). "
                              "По умолчанию — полный датасет.")
@@ -440,8 +462,10 @@ def main():
     print(f"Vocab size: {tokenizer.vocab_size}")
 
     pruner = optuna.pruners.MedianPruner(
-        n_startup_trials=3,   # первые 3 трейла не прунятся — строим статистику
-        n_warmup_steps=1,     # минимум 2 эпохи до прунинга (warmup_steps=1 → прун с epoch 2)
+        n_startup_trials=10,  # на 6-dim search нужно больше "якорей" для медианы
+        n_warmup_steps=5,     # не прунить до epoch 6 — warmup может занимать ~2-3 эпохи
+                              # при больших warmup_steps, плюс не убивать трейл до того
+                              # как он увидит первый curriculum-переход (epoch 6 при schedule=40)
     )
     sampler = optuna.samplers.TPESampler(seed=args.seed)
 

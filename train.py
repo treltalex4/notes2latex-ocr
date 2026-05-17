@@ -312,7 +312,7 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
     train_loader, val_loader, _ = build_multi_dataloaders(config, tokenizer, stage=stage)
     print(f"Batches: train={len(train_loader)} val={len(val_loader)}")
 
-    base_lr = (args.lr if args.lr is not None else config.learning_rate) * lr_multiplier
+    base_lr = config.learning_rate * lr_multiplier   # args.lr уже в config через overrides
     optimizer = AdamW(model.parameters(), lr=base_lr, weight_decay=config.weight_decay)
     criterion = nn.CrossEntropyLoss(
         ignore_index=PAD_ID,
@@ -328,7 +328,7 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
     # восстанавливает позицию, а форма косинуса должна совпадать с оригиналом.
     # Поэтому --epochs-stage* при resume должен быть тем же, что в первом запуске.
     total_steps = max(1, steps_per_epoch * epochs)
-    warmup = args.warmup_steps if args.warmup_steps is not None else config.warmup_steps
+    warmup = config.warmup_steps   # args.warmup_steps уже в config через overrides
     scheduler = make_lr_scheduler(optimizer, warmup, total_steps)
     print(f"Scheduler: warmup={warmup} total_steps={total_steps} "
           f"(accum={accum_steps}, effective_batch={config.batch_size * accum_steps}, "
@@ -395,9 +395,12 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
                 "weight_decay":    config.weight_decay,
                 "dropout":         config.dropout,
                 "label_smoothing": config.label_smoothing,
+                "grad_clip_norm":  config.grad_clip_norm,
                 "batch_size":      config.batch_size,
                 "grad_accum":      config.grad_accum_steps,
                 "warmup_steps":    warmup,
+                "use_compile":     config.use_compile,
+                "compile_mode":    config.compile_mode if config.use_compile else None,
                 "limit_batches":   args.limit_batches,
                 "epochs":          epochs,
                 "seed":            args.seed,
@@ -585,6 +588,16 @@ def main():
     parser.add_argument("--log-every", type=int, default=50)
     parser.add_argument("--warmup-steps", type=int, default=None,
                         help="override config.warmup_steps (useful for debug runs)")
+    parser.add_argument("--grad-clip-norm", type=float, default=None,
+                        help="override config.grad_clip_norm. Tune подбирает 0.3-2.0, "
+                             "против дивергенции на curriculum-переходах.")
+    parser.add_argument("--use-compile", action=argparse.BooleanOptionalAction, default=None,
+                        help="override config.use_compile. Используй --use-compile на "
+                             "Linux/сервере, --no-use-compile на Windows/ноутбуке.")
+    parser.add_argument("--compile-mode", choices=["default", "reduce-overhead", "max-autotune"],
+                        default=None,
+                        help="override config.compile_mode. max-autotune для долгих "
+                             "прогонов (компиляция ~3-5мин, +5-10% к default).")
     parser.add_argument("--resume-from", default=None,
                         help="Путь к чекпоинту для полного resume (model + optimizer + "
                              "scheduler + scaler + счётчики early stopping). "
@@ -632,6 +645,18 @@ def main():
         overrides["dropout"] = args.dropout
     if args.label_smoothing is not None:
         overrides["label_smoothing"] = args.label_smoothing
+    # Унифицировано: lr/warmup/grad_clip тоже идут через overrides, чтобы config
+    # объект отражал реально используемые значения (важно для history + run_name).
+    if args.lr is not None:
+        overrides["learning_rate"] = args.lr
+    if args.warmup_steps is not None:
+        overrides["warmup_steps"] = args.warmup_steps
+    if args.grad_clip_norm is not None:
+        overrides["grad_clip_norm"] = args.grad_clip_norm
+    if args.use_compile is not None:
+        overrides["use_compile"] = args.use_compile
+    if args.compile_mode is not None:
+        overrides["compile_mode"] = args.compile_mode
 
     config = load_config(args.profile, **overrides)
 

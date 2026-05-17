@@ -49,11 +49,13 @@ class Config:
     # с mode="max-autotune" ещё +5-10% (но компиляция первого шага ~3-5 мин).
     # Чекпоинты сохраняются как "голые" веса (без _orig_mod префикса),
     # поэтому совместимы между compile=True и compile=False.
-    use_compile: bool = False
+    use_compile: bool = True
     compile_mode: str = "default"    # "default" | "reduce-overhead" | "max-autotune"
 
     # ===== Data Loading =====
-    num_workers: int = 6
+    # num_workers: ставить ~= числу физических CPU/2 или vCPU/2.
+    # 16 vCPU (Linux серверы) → 8. На Windows 6 (меньше из-за spawn overhead).
+    num_workers: int = 8
     prefetch_factor: int = 4
 
     # ===== Datasets =====
