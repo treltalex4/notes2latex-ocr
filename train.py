@@ -57,24 +57,24 @@ def _unwrap_compiled(model):
 
 
 def _compile_model(model, config):
-    """Обёртка torch.compile с настройками против recompile-thrashing.
+    """Обёртка torch.compile с правильной поддержкой dynamic shapes.
 
-    BucketBatchSampler даёт батчи разной ширины (~20-50 уникальных значений
-    за прогон). Без явных настроек dynamo специализируется на первых N формах,
-    при превышении cache_size_limit (default 8) сдаётся и падает в eager —
-    отсюда катастрофическая просадка скорости. Лечим двумя ручками:
-      - cache_size_limit=256: запас на все возможные размеры батча
-      - dynamic=True (уже было): подсказка dynamo сразу строить
-        дин-shape-graph вместо специализации.
+    Variable размерности (ширина батча от BucketBatchSampler, длина формулы T)
+    помечены явно через torch._dynamo.maybe_mark_dynamic в Notes2LaTeX.forward.
+    Это даёт ОДНУ компиляцию вместо специализации на каждой форме.
+
+    cache_size_limit=32 — safety net на случай если какие-то под-графы
+    специализируются (например, разные ветки в SDPA с/без mask). 32 с запасом
+    покрывает все варианты, не давая зацикливания.
     """
     import torch._dynamo
-    torch._dynamo.config.cache_size_limit = 256
+    torch._dynamo.config.cache_size_limit = 32
     if sys.platform == "win32":
         print(f"WARNING: use_compile=True на Windows — Triton поддерживается плохо, "
               f"возможны падения или отсутствие ускорения. Рекомендуется False.")
-    print(f"torch.compile: mode={config.compile_mode} dynamic=True "
-          f"cache_size_limit=256 (первая эпоха медленнее из-за компиляции)")
-    return torch.compile(model, mode=config.compile_mode, dynamic=True)
+    print(f"torch.compile: mode={config.compile_mode} (variable W, T помечены "
+          f"через mark_dynamic — компиляция один раз)")
+    return torch.compile(model, mode=config.compile_mode)
 
 
 def _make_checkpoint(stage, stage_name, epoch, model, optimizer, scheduler, scaler,

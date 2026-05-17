@@ -87,10 +87,15 @@ class HybridEncoder(nn.Module):
             batch_first=True,
         )
 
-        self.transformer = nn.TransformerEncoder (
+        # enable_nested_tensor=False: fast path использует nested tensor API
+        # (warning "PyTorch API of nested tensors is in prototype stage"), которая
+        # ломает torch.compile + dynamic shapes. Slow path (обычный transformer
+        # с маской) совместим с compile и в bf16 на 5090 разница в скорости минимальна.
+        self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=config.num_encoder_layers,
             norm=nn.LayerNorm(config.d_model),
+            enable_nested_tensor=False,
         )
 
     def forward(
