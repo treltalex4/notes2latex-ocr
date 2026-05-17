@@ -218,7 +218,7 @@ _PROFILES: dict[str, dict[str, Any]] = {
         "max_seq_len": 1024,
         "batch_size": 32,
         "grad_accum_steps": 2,          # effective bs = 64
-        "num_workers": 8,
+        "num_workers": 14,              # 16 vCPU выделенного сервера: 14 воркеров + 2 для main/sys
         "amp_dtype": "bfloat16",
         "target_height": 160,           # больше пикселей → лучше мелкие индексы
         "max_width": 2800,              # 32GB позволяет держать тот же max_width что и 4060
