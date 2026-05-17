@@ -49,6 +49,13 @@ def _save_history(history: dict, path: str) -> None:
 _STAGE_NAMES = {1: "pretrain", 2: "mixed"}
 
 
+def _unwrap_compiled(model):
+    """Возвращает оригинальную модель если она обёрнута torch.compile.
+    Нужно для save/load state_dict — чекпоинты должны быть без _orig_mod префикса,
+    чтобы работать кроссплатформенно (Windows без compile / Linux с compile)."""
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
 def _make_checkpoint(stage, stage_name, epoch, model, optimizer, scheduler, scaler,
                      best_val_loss, epochs_no_improve, history_path, vocab_size,
                      val_loss, val_acc, val_em, interrupted=False) -> dict:
@@ -62,7 +69,7 @@ def _make_checkpoint(stage, stage_name, epoch, model, optimizer, scheduler, scal
         "stage_name": stage_name,
         "epoch": epoch,
         "interrupted": interrupted,
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": _unwrap_compiled(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
@@ -331,7 +338,13 @@ def run_stage(model, config, args, tokenizer, device, scaler, use_amp, amp_dtype
     last_path = os.path.join(config.checkpoint_dir, f"last_{stage_name}.pth")
 
     # --- Resume: optimizer/scheduler/scaler + счётчики early stopping ---
-    full_resume = resume_state is not None and "optimizer_state_dict" in resume_state
+    reset_schedule = getattr(args, "reset_schedule", False)
+    full_resume = (resume_state is not None
+                   and "optimizer_state_dict" in resume_state
+                   and not reset_schedule)
+    if reset_schedule and resume_state is not None:
+        print("  --reset-schedule: optimizer/scheduler созданы заново под текущий config "
+              f"(lr={base_lr:.2e}, warmup={warmup}); early stopping сброшен")
     if full_resume:
         optimizer.load_state_dict(resume_state["optimizer_state_dict"])
         scheduler.load_state_dict(resume_state["scheduler_state_dict"])
@@ -583,6 +596,11 @@ def main():
                              "(обычно вместе со сменой гиперов, иначе воспроизведётся та же "
                              "траектория); interrupt=аварийная точка, перезапускает "
                              "прерванную эпоху.")
+    parser.add_argument("--reset-schedule", action="store_true",
+                        help="При resume: загрузить только веса модели, optimizer/scheduler "
+                             "создать заново под текущий config (новый lr, warmup_steps). "
+                             "Сбрасывает счётчик эпох и early stopping. Используй когда меняешь "
+                             "lr/warmup и продолжаешь с best checkpoint.")
     parser.add_argument("--seed", type=int, default=None,
                         help="Override config.seed. None в config = random.")
     parser.add_argument("--run-name", default=None,
@@ -640,6 +658,14 @@ def main():
     model = Notes2LaTeX(config, tokenizer.vocab_size).to(device)
     print(f"Параметров: {count_parameters(model):,}")
 
+    if config.use_compile:
+        if sys.platform == "win32":
+            print(f"WARNING: use_compile=True на Windows — Triton поддерживается плохо, "
+                  f"возможны падения или отсутствие ускорения. Рекомендуется False.")
+        print(f"torch.compile: mode={config.compile_mode} dynamic=True "
+              f"(первая эпоха будет медленнее из-за компиляции)")
+        model = torch.compile(model, mode=config.compile_mode, dynamic=True)
+
     resume_path = _resolve_resume_path(args, config)
     resume_state = None
     if resume_path is not None:
@@ -647,7 +673,7 @@ def main():
             print(f"ERROR: resume-чекпоинт не найден: {resume_path}")
             sys.exit(1)
         resume_state = torch.load(resume_path, map_location=device)
-        model.load_state_dict(resume_state["model_state_dict"])
+        _unwrap_compiled(model).load_state_dict(resume_state["model_state_dict"])
         kind = "interrupt (mid-epoch)" if resume_state.get("interrupted") else "epoch-boundary"
         bvl = resume_state.get("best_val_loss")
         print(f"Resume: {resume_path}")
@@ -698,7 +724,7 @@ def main():
             # Пропускаем, если резюмим саму эту стадию (веса уже загружены).
             if last_ckpt is not None and stage_resume is None:
                 state = torch.load(last_ckpt, map_location=device)
-                model.load_state_dict(state["model_state_dict"])
+                _unwrap_compiled(model).load_state_dict(state["model_state_dict"])
                 print(f"\nLoaded best from previous stage: {last_ckpt}")
 
             last_ckpt = run_stage(

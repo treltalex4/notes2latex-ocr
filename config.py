@@ -13,7 +13,7 @@ class Config:
     num_encoder_layers: int = 4
     num_decoder_layers: int = 4
     dim_feedforward: int = 1024
-    dropout: float = 0.11
+    dropout: float = 0.23
     max_seq_len: int = 1024         # верхний предел для PE encoder'а (mem_len = max_width/4)
     use_rope: bool = True           # RoPE в декодере вместо learnable PE
 
@@ -25,14 +25,14 @@ class Config:
     # ===== Training =====
     batch_size: int = 12            # снижено с 16 → запас VRAM на широкие картинки
     grad_accum_steps: int = 2       # effective bs = 24 (lr=1e-3 валидирован при bs=32, разница 25% — терпимо)
-    grad_clip_norm: float = 0.98
-    learning_rate: float = 2e-4
-    weight_decay: float = 0.0003
-    label_smoothing: float = 0.02    # CE label smoothing; 0.05–0.1 — типично для seq2seq
+    grad_clip_norm: float = 0.85
+    learning_rate: float = 3.7e-4
+    weight_decay: float = 2.342e-3
+    label_smoothing: float = 0.002    # CE label smoothing; 0.05–0.1 — типично для seq2seq
     epochs_pretrain: int = 40       # этап 1: формулы (im2latex)
     epochs_mixed: int = 40          # этап 2: формулы + синтетика
     epochs_finetune: int = 20       # этап 3: свой датасет (с replay synthetic)
-    warmup_steps: int = 3000
+    warmup_steps: int = 12000
     patience: int = 8               # early stopping (20% от epochs_pretrain)
     seed: int = 42                  # фиксированный seed (None = random)
     n_em_batches: int = 150          # сколько val-батчей идёт в EM-метрику
@@ -42,6 +42,15 @@ class Config:
     # ===== Mixed Precision =====
     use_amp: bool = True
     amp_dtype: str = "bfloat16"      # "float16" | "bfloat16"
+
+    # ===== torch.compile =====
+    # На Windows держать False — Triton слабо поддерживается.
+    # На Linux + современный GPU (Ampere+) даёт 20-40% ускорения,
+    # с mode="max-autotune" ещё +5-10% (но компиляция первого шага ~3-5 мин).
+    # Чекпоинты сохраняются как "голые" веса (без _orig_mod префикса),
+    # поэтому совместимы между compile=True и compile=False.
+    use_compile: bool = False
+    compile_mode: str = "default"    # "default" | "reduce-overhead" | "max-autotune"
 
     # ===== Data Loading =====
     num_workers: int = 6
@@ -132,8 +141,9 @@ class Config:
     # Постепенное расширение допустимой длины формул (только stage 1)
     # list[(доля_эпох_стадии, max_tokens)]
     length_curriculum_stage1: list = field(default_factory=lambda: [
-        (0.20, 200),    # первые 20% эпох — формулы до 200 токенов
-        (0.50, 350),
+        (0.15, 200),    # первые 20% эпох — формулы до 200 токенов
+        (0.30, 280),
+        (0.55, 350),
         (1.00, 512),
     ])
 
@@ -199,7 +209,7 @@ _PROFILES: dict[str, dict[str, Any]] = {
     },
     "rtx5090_32gb": {
         "d_model": 512,
-        "nhead": 8,
+        "nhead": 16,                    # head_dim = 512/16 = 32 (как у 4060: 256/8=32)
         "num_encoder_layers": 8,
         "num_decoder_layers": 8,
         "dim_feedforward": 2048,
@@ -209,7 +219,7 @@ _PROFILES: dict[str, dict[str, Any]] = {
         "num_workers": 8,
         "amp_dtype": "bfloat16",
         "target_height": 160,           # больше пикселей → лучше мелкие индексы
-        "max_width": 2048,
+        "max_width": 2800,              # 32GB позволяет держать тот же max_width что и 4060
         "cnn_channels": (64, 128, 256, 512),
         "synthetic_count": 150_000,
         "latex_templates_count": 2000,

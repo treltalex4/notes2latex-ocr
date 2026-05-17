@@ -7,15 +7,23 @@ train/val − бонус за val_em. Подробности — в _compute_obj
 MedianPruner + явный divergence-prune убивают плохие трейлы досрочно.
 
 Использование:
-    # Стандартный overnight поиск: 15 трейлов × 6 эпох на полном датасете.
-    # Ожидаемо ~3-4 будут pruned досрочно → ~15-18 часов на RTX 4060.
-    python tune.py
+    # РЕКОМЕНДУЕТСЯ для будущего 40-эпохового прогона: scheduler думает что
+    # горизонт 40, реально гоняем 8 трейл-эпох. LR-режим в трейле = LR-режим
+    # первых 8 эпох real-run'а (warmup + удержание около пика). Без флага
+    # scheduler сожмёт decay в trial-эпохи и финдинг будет смещён к слишком
+    # высоким LR (как было в lr_search_v3).
+    python tune.py --schedule-epochs 40 --epochs 8 --study-name lr_for_40ep
 
     # С указанием study name (для resume после прерывания)
     python tune.py --study-name lr_search_v2 --storage sqlite:///optuna.db
 
     # Быстрый smoke-тест (не для реального поиска)
     python tune.py --n-trials 2 --epochs 1 --limit-batches 50
+
+Важно: только learning_rate horizon-dependent (через cosine schedule).
+weight_decay/dropout/label_smoothing применяются per-step и одинаковы.
+Curriculum/elastic/strength остаются сжатыми в args.epochs — иначе
+трейл не увидит длинных формул и не проверит LR против сложных данных.
 
 Результаты пишутся в --output (по умолчанию checkpoints/tune_results.json):
 лучший трейл, топ-5, search space, готовая CLI-команда для train.py.
@@ -88,7 +96,7 @@ OBJ_EM            = 1.5    # бонус за val_em (EM ∈ [0,1], выше — 
 # Divergence-prune: независимо от MedianPruner убиваем трейл, который
 # расходится САМ В СЕБЕ — val_loss поднялся выше ratio× своего минимума.
 DIVERGENCE_RATIO         = 1.3
-DIVERGENCE_WARMUP_EPOCHS = 2   # первые N эпох не проверяем (warmup, curriculum)
+DIVERGENCE_WARMUP_EPOCHS = 3   # первые N эпох не проверяем (warmup может занимать ~2 эпохи)
 
 
 def _tail_mean(xs: list[float], k: int = TAIL_EPOCHS) -> float:
@@ -159,6 +167,11 @@ def make_objective(args, base_overrides: dict, tokenizer: LaTeXTokenizer, device
         model = Notes2LaTeX(config, tokenizer.vocab_size).to(device)
         if trial.number == 0:
             print(f"  Параметров модели: {count_parameters(model):,}")
+            if config.use_compile and sys.platform == "win32":
+                print(f"  WARNING: use_compile=True на Windows — Triton поддерживается плохо")
+
+        if config.use_compile:
+            model = torch.compile(model, mode=config.compile_mode, dynamic=True)
 
         # AMP
         amp_dtype = torch.bfloat16 if config.amp_dtype == "bfloat16" else torch.float16
@@ -174,22 +187,35 @@ def make_objective(args, base_overrides: dict, tokenizer: LaTeXTokenizer, device
         if args.limit_batches:
             batches_per_epoch = min(batches_per_epoch, args.limit_batches)
         steps_per_epoch = max(1, batches_per_epoch // accum_steps)
-        total_steps = max(1, steps_per_epoch * args.epochs)
 
-        # Warmup: используем config.warmup_steps если он помещается в трейл
-        # (< 50% total_steps). Иначе масштабируем до 15% — это гарантирует
-        # что warmup завершится и модель успеет поработать при целевом LR.
-        if config.warmup_steps <= total_steps * 0.5:
+        # Scheduler total_steps РАСЦЕПЛЕНЫ от длины трейла.
+        # Если args.schedule_epochs задан → scheduler считает что горизонт
+        # такой (например 40), а трейл реально гоняет args.epochs (например 8).
+        # Это даёт трейлу LR-режим первых args.epochs эпох реального прогона
+        # вместо сжатого cosine, где LR быстро остывает.
+        schedule_epochs = args.schedule_epochs or args.epochs
+        scheduler_total_steps = max(1, steps_per_epoch * schedule_epochs)
+        trial_total_steps     = max(1, steps_per_epoch * args.epochs)
+
+        # Warmup: если задан schedule_epochs — используем config.warmup_steps
+        # как есть (он рассчитан на real-horizon). Иначе fallback на старую
+        # логику для backward-compat.
+        if args.schedule_epochs:
+            trial_warmup = config.warmup_steps
+        elif config.warmup_steps <= trial_total_steps * 0.5:
             trial_warmup = config.warmup_steps
         else:
-            trial_warmup = max(30, int(total_steps * 0.15))
+            trial_warmup = max(30, int(trial_total_steps * 0.15))
+
         if trial.number == 0:
-            print(f"  Trial budget: total_steps={total_steps}  warmup={trial_warmup}")
+            print(f"  Trial: epochs={args.epochs} steps={trial_total_steps}  "
+                  f"Scheduler horizon: epochs={schedule_epochs} steps={scheduler_total_steps}  "
+                  f"warmup={trial_warmup}")
 
         optimizer = AdamW(model.parameters(),
                           lr=config.learning_rate,
                           weight_decay=config.weight_decay)
-        scheduler = make_lr_scheduler(optimizer, trial_warmup, total_steps)
+        scheduler = make_lr_scheduler(optimizer, trial_warmup, scheduler_total_steps)
         criterion = nn.CrossEntropyLoss(
             ignore_index=PAD_ID,
             label_smoothing=config.label_smoothing,
@@ -231,7 +257,7 @@ def make_objective(args, base_overrides: dict, tokenizer: LaTeXTokenizer, device
             val_loss, val_acc, val_em = validate(
                 model, val_loader, criterion, tokenizer, device,
                 use_amp=use_amp, amp_dtype=amp_dtype,
-                n_em_batches=10,   # 10 батчей ~120 примеров — достаточно для EM-сигнала
+                n_em_batches=args.n_em_batches,
                 limit_batches=args.val_limit_batches,
                 greedy_max_len=config.beam_max_len,
             )
@@ -354,11 +380,20 @@ def main():
     parser.add_argument("--profile", default="rtx4060_8gb")
     parser.add_argument("--n-trials", type=int, default=16,
                         help="Сколько трейлов")
-    parser.add_argument("--epochs", type=int, default=6,
-                        help="Эпох в одном трейле на полном датасете. 6 эпох: "
-                             "warmup завершается к концу epoch 1, далее 5 эпох "
-                             "при рабочем LR — достаточно чтобы плохие конфиги "
-                             "разошлись и были убиты pruner'ом.")
+    parser.add_argument("--epochs", type=int, default=8,
+                        help="Эпох в одном трейле на полном датасете. 8 эпох: "
+                             "warmup ~2 эпохи (при schedule-epochs=40, warmup=7000), "
+                             "далее 6 эпох при рабочем LR — достаточно для "
+                             "discrimination между конфигами + есть запас "
+                             "перед divergence-prune (DIVERGENCE_WARMUP_EPOCHS=3).")
+    parser.add_argument("--schedule-epochs", type=int, default=40,
+                        help="Горизонт LR-scheduler в эпохах")
+    parser.add_argument("--n-em-batches", type=int, default=30,
+                        help="Сколько val-батчей идёт в EM-метрику внутри трейла. "
+                             "Старый дефолт 10 (~120 примеров) был в зоне шума. "
+                             "30 (~360 примеров) выводит EM из шума при минимальном "
+                             "оверхеде. Поднимать выше 50 не нужно — greedy decode "
+                             "становится узким горлышком.")
     parser.add_argument("--limit-batches", type=int, default=None,
                         help="Ограничить train-батчи (только для smoke-тестов). "
                              "По умолчанию — полный датасет.")
