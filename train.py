@@ -49,6 +49,18 @@ def _save_history(history: dict, path: str) -> None:
 _STAGE_NAMES = {1: "pretrain", 2: "mixed"}
 
 
+def _mark_dynamic_inputs(images, tgt_ids, src_kpm):
+    """Помечает переменные размерности (W у картинок, T у токенов) как
+    динамические — ОДНА компиляция graph'а покрывает все формы вместо
+    специализации/рекомпиляции на каждую новую. Вызывается ДО model(...) ,
+    т.е. вне compile-региона (внутри trace dynamo запрещает эту функцию).
+    Сами вызовы — no-op если model не обёрнут в torch.compile."""
+    torch._dynamo.maybe_mark_dynamic(images, 3)      # W
+    torch._dynamo.maybe_mark_dynamic(tgt_ids, 1)     # T
+    if src_kpm is not None:
+        torch._dynamo.maybe_mark_dynamic(src_kpm, 1)  # W
+
+
 def _unwrap_compiled(model):
     """Возвращает оригинальную модель если она обёрнута torch.compile.
     Нужно для save/load state_dict — чекпоинты должны быть без _orig_mod префикса,
@@ -237,6 +249,9 @@ def train_one_epoch(model, loader, optimizer, scheduler, scaler, criterion, toke
         tgt_input  = tgt_ids[:, :-1]
         tgt_output = tgt_ids[:, 1:]
 
+        # mark_dynamic ДО model() — внутри compile-региона эта функция запрещена.
+        _mark_dynamic_inputs(images, tgt_input, src_kpm)
+
         # Forward — внутри autocast все операции автоматически в half precision.
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(images, tgt_input, src_key_padding_mask=src_kpm)
@@ -301,6 +316,8 @@ def validate(model, loader, criterion, tokenizer, device,
 
         tgt_input  = tgt_ids[:, :-1]
         tgt_output = tgt_ids[:, 1:]
+
+        _mark_dynamic_inputs(images, tgt_input, src_kpm)
 
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             logits = model(images, tgt_input, src_key_padding_mask=src_kpm)

@@ -26,17 +26,6 @@ class Notes2LaTeX(nn.Module):
         src_key_padding_mask: torch.Tensor | None = None,
         tgt_key_padding_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        # Явная пометка переменных размерностей для torch.compile.
-        # BucketBatchSampler даёт батчи разной ширины (W) и длины формулы (T).
-        # Без mark_dynamic dynamo специализируется на первой форме, ловит
-        # mismatch на второй, перекомпилирует — и так до hit cache_size_limit.
-        # С mark_dynamic — одна компиляция для всех форм. maybe_mark_dynamic
-        # безопасен вне compile-режима (no-op).
-        torch._dynamo.maybe_mark_dynamic(images, 3)              # W
-        torch._dynamo.maybe_mark_dynamic(tgt_ids, 1)             # T
-        if src_key_padding_mask is not None:
-            torch._dynamo.maybe_mark_dynamic(src_key_padding_mask, 1)  # W
-
         memory, memory_kpm = self.encoder(images, src_key_padding_mask=src_key_padding_mask)
         logits = self.decoder(
             tgt_ids, memory,
