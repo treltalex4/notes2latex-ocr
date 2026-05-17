@@ -1,12 +1,10 @@
 """
-Download and prepare im2latex-100k dataset from Kaggle.
+Download and prepare im2latex-100k dataset from Zenodo (record 56198).
 
 Usage:
     python download_im2latex.py [--data-dir data_raw]
 
-Requires:
-    pip install kaggle
-    ~/.kaggle/kaggle.json  (from https://www.kaggle.com/settings → API → Create New Token)
+No authentication required.
 
 Expected output structure (matches prepare_data.py expectations):
     data_raw/
@@ -19,215 +17,126 @@ Expected output structure (matches prepare_data.py expectations):
 """
 
 import argparse
-import os
 import shutil
-import subprocess
 import sys
 import tarfile
-import zipfile
+import urllib.request
 from pathlib import Path
 
 
-KAGGLE_DATASET = "shahrukhkhan/im2latex-100k"
+ZENODO_BASE = "https://zenodo.org/api/records/56198/files"
 
-# Expected files after download
-REQUIRED_LST = [
+LST_FILES = [
     "im2latex_formulas.lst",
     "im2latex_train.lst",
     "im2latex_validate.lst",
     "im2latex_test.lst",
 ]
 
+IMAGES_ARCHIVE = "formula_images.tar.gz"
 
-def _check_kaggle():
+
+def _download(url: str, dest: Path) -> None:
+    print(f"  Downloading {dest.name} ...")
+    tmp = dest.with_suffix(dest.suffix + ".part")
     try:
-        import kaggle  # noqa: F401
-    except ImportError:
-        print("ERROR: kaggle not installed. Run: pip install kaggle")
+        def _progress(count, block_size, total):
+            if total > 0:
+                pct = min(100, count * block_size * 100 // total)
+                mb = count * block_size / 1_048_576
+                total_mb = total / 1_048_576
+                print(f"\r  {pct:3d}%  {mb:.1f} / {total_mb:.1f} MB", end="", flush=True)
+
+        urllib.request.urlretrieve(url, tmp, reporthook=_progress)
+        print()
+        tmp.rename(dest)
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        print(f"\n  ERROR: {e}")
         sys.exit(1)
-
-    cred_path = Path.home() / ".kaggle" / "kaggle.json"
-    if not cred_path.exists():
-        print(
-            f"ERROR: Kaggle credentials not found at {cred_path}\n"
-            "  1. Go to https://www.kaggle.com/settings\n"
-            "  2. API → Create New Token\n"
-            "  3. Save kaggle.json to ~/.kaggle/kaggle.json\n"
-            "  4. chmod 600 ~/.kaggle/kaggle.json"
-        )
-        sys.exit(1)
-
-
-def _run(cmd: str) -> None:
-    print(f"  $ {cmd}")
-    ret = subprocess.run(cmd, shell=True)
-    if ret.returncode != 0:
-        print(f"ERROR: command failed (exit {ret.returncode})")
-        sys.exit(1)
-
-
-def _extract_archive(archive_path: Path, dest: Path) -> None:
-    """Extract tar.gz or zip into dest/."""
-    dest.mkdir(parents=True, exist_ok=True)
-    name = archive_path.name.lower()
-
-    if name.endswith(".tar.gz") or name.endswith(".tgz"):
-        print(f"  Extracting {archive_path.name} ...")
-        with tarfile.open(archive_path, "r:gz") as tf:
-            tf.extractall(dest)
-    elif name.endswith(".tar"):
-        print(f"  Extracting {archive_path.name} ...")
-        with tarfile.open(archive_path, "r") as tf:
-            tf.extractall(dest)
-    elif name.endswith(".zip"):
-        print(f"  Extracting {archive_path.name} ...")
-        with zipfile.ZipFile(archive_path, "r") as zf:
-            zf.extractall(dest)
-    else:
-        print(f"  Unknown archive format: {archive_path.name} — skipping extraction")
-
-
-def _find_files(root: Path, extensions: tuple) -> list[Path]:
-    return [p for p in root.rglob("*") if p.suffix.lower() in extensions]
-
-
-def _find_file(root: Path, filename: str) -> Path | None:
-    matches = list(root.rglob(filename))
-    return matches[0] if matches else None
-
-
-def _collect_images(src_dir: Path, dest_dir: Path) -> int:
-    """Move all .png files from src_dir (recursively) into dest_dir."""
-    dest_dir.mkdir(parents=True, exist_ok=True)
-    moved = 0
-    for png in src_dir.rglob("*.png"):
-        target = dest_dir / png.name
-        if not target.exists():
-            shutil.move(str(png), str(target))
-            moved += 1
-    return moved
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Download im2latex-100k from Kaggle")
-    parser.add_argument("--data-dir", default="data_raw", help="Target directory")
-    parser.add_argument(
-        "--force", action="store_true", help="Re-download even if already present"
-    )
+    parser = argparse.ArgumentParser(description="Download im2latex-100k from Zenodo")
+    parser.add_argument("--data-dir", default="data_raw")
+    parser.add_argument("--force", action="store_true", help="Re-download even if present")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
     formula_images_dir = data_dir / "formula_images"
+    data_dir.mkdir(parents=True, exist_ok=True)
 
     # ── Check if already done ──────────────────────────────────────────────────
     if not args.force:
-        lst_ok = all((data_dir / f).exists() for f in REQUIRED_LST)
+        lst_ok = all((data_dir / f).exists() for f in LST_FILES)
         imgs_ok = formula_images_dir.exists() and any(formula_images_dir.iterdir())
         if lst_ok and imgs_ok:
             n = sum(1 for _ in formula_images_dir.glob("*.png"))
-            print(f"Dataset already present: {data_dir} ({n} images). Use --force to re-download.")
+            print(f"Dataset already present ({n} images). Use --force to re-download.")
             return
 
-    _check_kaggle()
-
-    # ── Download ───────────────────────────────────────────────────────────────
-    tmp_dir = data_dir / "_download_tmp"
-    tmp_dir.mkdir(parents=True, exist_ok=True)
-
-    print(f"\nDownloading {KAGGLE_DATASET} → {tmp_dir} ...")
-    _run(f"kaggle datasets download -d {KAGGLE_DATASET} -p {tmp_dir}")
-
-    # ── Extract top-level zip/tar ──────────────────────────────────────────────
-    archives = list(tmp_dir.glob("*.zip")) + list(tmp_dir.glob("*.tar.gz")) + list(tmp_dir.glob("*.tar"))
-    if not archives:
-        print("ERROR: no archives found in download dir. Check Kaggle download output.")
-        sys.exit(1)
-
-    extract_dir = tmp_dir / "extracted"
-    for arch in archives:
-        _extract_archive(arch, extract_dir)
-
-    # ── Extract nested archives (some versions have formula_images.tar.gz) ─────
-    for nested in extract_dir.rglob("*.tar.gz"):
-        print(f"  Found nested archive: {nested.name}")
-        _extract_archive(nested, nested.parent)
-        nested.unlink()
-
-    for nested in extract_dir.rglob("*.tar"):
-        print(f"  Found nested archive: {nested.name}")
-        _extract_archive(nested, nested.parent)
-        nested.unlink()
-
-    # ── Copy .lst files ────────────────────────────────────────────────────────
-    print("\nCopying .lst files ...")
-    data_dir.mkdir(parents=True, exist_ok=True)
-
-    missing = []
-    for lst_name in REQUIRED_LST:
-        src = _find_file(extract_dir, lst_name)
-        if src is None:
-            missing.append(lst_name)
+    # ── Download .lst files ────────────────────────────────────────────────────
+    print("\n=== Downloading .lst files ===")
+    for fname in LST_FILES:
+        dest = data_dir / fname
+        if dest.exists() and not args.force:
+            print(f"  {fname} already exists, skipping")
             continue
-        dst = data_dir / lst_name
-        shutil.copy2(str(src), str(dst))
-        print(f"  {lst_name} → {dst}")
+        _download(f"{ZENODO_BASE}/{fname}/content", dest)
 
-    if missing:
-        print(f"\nWARN: could not find: {missing}")
-        print("  Check extract_dir manually:", extract_dir)
+    # ── Download and extract formula_images.tar.gz ─────────────────────────────
+    archive_path = data_dir / IMAGES_ARCHIVE
 
-    # ── Collect all PNGs → formula_images/ ────────────────────────────────────
-    print("\nCollecting formula images ...")
-
-    # First try: there's already a formula_images/ directory somewhere
-    img_src = None
-    for candidate in extract_dir.rglob("formula_images"):
-        if candidate.is_dir():
-            img_src = candidate
-            break
-
-    if img_src:
-        print(f"  Found formula_images at {img_src}")
-        if img_src != formula_images_dir:
-            if formula_images_dir.exists():
-                shutil.rmtree(formula_images_dir)
-            shutil.move(str(img_src), str(formula_images_dir))
+    if not archive_path.exists() or args.force:
+        print("\n=== Downloading formula_images.tar.gz (~292 MB) ===")
+        _download(f"{ZENODO_BASE}/{IMAGES_ARCHIVE}/content", archive_path)
     else:
-        # Fallback: collect all .png files from anywhere in extract_dir
-        print("  No formula_images/ dir found — collecting all .png recursively ...")
-        n = _collect_images(extract_dir, formula_images_dir)
-        print(f"  Collected {n} images")
+        print(f"\n  {IMAGES_ARCHIVE} already downloaded, skipping")
+
+    print("\n=== Extracting formula_images.tar.gz ===")
+    print("  This may take a few minutes ...")
+    if formula_images_dir.exists() and args.force:
+        shutil.rmtree(formula_images_dir)
+
+    formula_images_dir.mkdir(exist_ok=True)
+    with tarfile.open(archive_path, "r:gz") as tf:
+        members = tf.getmembers()
+        total = len(members)
+        for i, member in enumerate(members):
+            if member.isfile() and member.name.endswith(".png"):
+                member.name = Path(member.name).name  # strip any path prefix
+                tf.extract(member, formula_images_dir)
+            if (i + 1) % 5000 == 0:
+                print(f"  {i + 1}/{total} files ...", flush=True)
+
+    archive_path.unlink()  # free space
 
     # ── Verify ─────────────────────────────────────────────────────────────────
-    print("\nVerifying ...")
+    print("\n=== Verifying ===")
     ok = True
-    for lst_name in REQUIRED_LST:
-        path = data_dir / lst_name
+    for fname in LST_FILES:
+        path = data_dir / fname
         if path.exists():
             lines = path.read_text(encoding="latin-1").strip().splitlines()
-            print(f"  ✓ {lst_name}: {len(lines)} lines")
+            print(f"  ✓ {fname}: {len(lines)} lines")
         else:
-            print(f"  ✗ MISSING: {lst_name}")
+            print(f"  ✗ MISSING: {fname}")
             ok = False
 
     if formula_images_dir.exists():
-        n_imgs = sum(1 for _ in formula_images_dir.glob("*.png"))
-        print(f"  ✓ formula_images/: {n_imgs} PNG files")
-        if n_imgs < 50_000:
-            print(f"  WARN: expected ~100k images, got {n_imgs} — download may be incomplete")
+        n = sum(1 for _ in formula_images_dir.glob("*.png"))
+        print(f"  ✓ formula_images/: {n} PNG files")
+        if n < 50_000:
+            print(f"  WARN: expected ~100k images, got {n}")
     else:
         print("  ✗ MISSING: formula_images/")
         ok = False
 
-    # ── Cleanup ────────────────────────────────────────────────────────────────
-    print(f"\nCleaning up {tmp_dir} ...")
-    shutil.rmtree(tmp_dir)
-
     if ok:
         print(f"\nDone. Dataset ready at: {data_dir.resolve()}")
-        print("Next step: python prepare_data.py --profile rtx5090_32gb --datasets im2latex")
+        print("Next: python prepare_data.py --profile rtx5090_32gb --datasets im2latex")
     else:
-        print("\nWARN: some files missing — check output above")
+        print("\nWARN: some files missing")
         sys.exit(1)
 
 
