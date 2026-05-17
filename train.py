@@ -56,6 +56,27 @@ def _unwrap_compiled(model):
     return model._orig_mod if hasattr(model, "_orig_mod") else model
 
 
+def _compile_model(model, config):
+    """Обёртка torch.compile с настройками против recompile-thrashing.
+
+    BucketBatchSampler даёт батчи разной ширины (~20-50 уникальных значений
+    за прогон). Без явных настроек dynamo специализируется на первых N формах,
+    при превышении cache_size_limit (default 8) сдаётся и падает в eager —
+    отсюда катастрофическая просадка скорости. Лечим двумя ручками:
+      - cache_size_limit=256: запас на все возможные размеры батча
+      - dynamic=True (уже было): подсказка dynamo сразу строить
+        дин-shape-graph вместо специализации.
+    """
+    import torch._dynamo
+    torch._dynamo.config.cache_size_limit = 256
+    if sys.platform == "win32":
+        print(f"WARNING: use_compile=True на Windows — Triton поддерживается плохо, "
+              f"возможны падения или отсутствие ускорения. Рекомендуется False.")
+    print(f"torch.compile: mode={config.compile_mode} dynamic=True "
+          f"cache_size_limit=256 (первая эпоха медленнее из-за компиляции)")
+    return torch.compile(model, mode=config.compile_mode, dynamic=True)
+
+
 def _make_checkpoint(stage, stage_name, epoch, model, optimizer, scheduler, scaler,
                      best_val_loss, epochs_no_improve, history_path, vocab_size,
                      val_loss, val_acc, val_em, interrupted=False) -> dict:
@@ -684,12 +705,7 @@ def main():
     print(f"Параметров: {count_parameters(model):,}")
 
     if config.use_compile:
-        if sys.platform == "win32":
-            print(f"WARNING: use_compile=True на Windows — Triton поддерживается плохо, "
-                  f"возможны падения или отсутствие ускорения. Рекомендуется False.")
-        print(f"torch.compile: mode={config.compile_mode} dynamic=True "
-              f"(первая эпоха будет медленнее из-за компиляции)")
-        model = torch.compile(model, mode=config.compile_mode, dynamic=True)
+        model = _compile_model(model, config)
 
     resume_path = _resolve_resume_path(args, config)
     resume_state = None

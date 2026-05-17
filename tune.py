@@ -56,6 +56,7 @@ from data.tokenizer import LaTeXTokenizer, PAD_ID
 from model.model import Notes2LaTeX, count_parameters
 from train import (
     apply_curriculum, make_lr_scheduler, train_one_epoch, validate,
+    _compile_model,
 )
 
 
@@ -177,7 +178,7 @@ def make_objective(args, base_overrides: dict, tokenizer: LaTeXTokenizer, device
                 print(f"  WARNING: use_compile=True на Windows — Triton поддерживается плохо")
 
         if config.use_compile:
-            model = torch.compile(model, mode=config.compile_mode, dynamic=True)
+            model = _compile_model(model, config)
 
         # AMP
         amp_dtype = torch.bfloat16 if config.amp_dtype == "bfloat16" else torch.float16
