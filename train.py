@@ -57,23 +57,30 @@ def _unwrap_compiled(model):
 
 
 def _compile_model(model, config):
-    """Обёртка torch.compile с правильной поддержкой dynamic shapes.
+    """Обёртка torch.compile с тройной защитой от recompile-thrash.
 
-    Variable размерности (ширина батча от BucketBatchSampler, длина формулы T)
-    помечены явно через torch._dynamo.maybe_mark_dynamic в Notes2LaTeX.forward.
-    Это даёт ОДНУ компиляцию вместо специализации на каждой форме.
+    Защиты (см. соответствующие места):
+    1. mark_dynamic в Notes2LaTeX.forward — dynamo должен сделать один
+       graph для всех форм (model/model.py).
+    2. enable_nested_tensor=False в TransformerEncoder — обход бага PyTorch
+       (issue #163640) где TransformerEncoder fast path с bool маской
+       несовместим с compile (model/encoder.py).
+    3. Bucket-padding в CollateFunction — ограничивает число уникальных форм
+       до WIDTH_BUCKETS × TGT_BUCKETS = 8 × 7 = 56 worst case. Если
+       mark_dynamic не сработает из-за бага PT (#172822 - LayerNorm backward
+       специализирует batch dim), мы упёрлись в фиксированный потолок
+       рекомпиляций, а не в зацикливание (data/dataset.py).
 
-    cache_size_limit=32 — safety net на случай если какие-то под-графы
-    специализируются (например, разные ветки в SDPA с/без mask). 32 с запасом
-    покрывает все варианты, не давая зацикливания.
+    cache_size_limit=128 — с запасом покрывает 56 worst case + ветки SDPA
+    (с/без маски, с/без kv_cache в декодере).
     """
     import torch._dynamo
-    torch._dynamo.config.cache_size_limit = 32
+    torch._dynamo.config.cache_size_limit = 128
     if sys.platform == "win32":
         print(f"WARNING: use_compile=True на Windows — Triton поддерживается плохо, "
               f"возможны падения или отсутствие ускорения. Рекомендуется False.")
-    print(f"torch.compile: mode={config.compile_mode} (variable W, T помечены "
-          f"через mark_dynamic — компиляция один раз)")
+    print(f"torch.compile: mode={config.compile_mode} cache_size_limit=128 "
+          f"(mark_dynamic + bucket-padding — рекомпиляций должно быть мало)")
     return torch.compile(model, mode=config.compile_mode)
 
 

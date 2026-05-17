@@ -170,9 +170,26 @@ class BucketBatchSampler(Sampler):
 
 
 class CollateFunction:
+    # Bucket-padding для совместимости с torch.compile:
+    # без бакетов BucketBatchSampler даёт ~30-50 уникальных ширин и длин →
+    # каждая форма рекомпилируется (cache_size_limit ловится). С бакетами —
+    # ровно len(WIDTH_BUCKETS) × len(TGT_BUCKETS) уникальных пар форм.
+    # Бакеты подобраны под распределение im2latex (median width≈400, p95≈1200)
+    # с лёгкими «лестничками» в часто используемом диапазоне.
+    WIDTH_BUCKETS: tuple[int, ...] = (256, 384, 512, 768, 1024, 1536, 2048, 2800)
+    TGT_BUCKETS:   tuple[int, ...] = (64, 96, 128, 192, 256, 384, 512)
+
     def __init__(self, tokenizer: LaTeXTokenizer, max_len: int = 512) -> None:
         self.tokenizer = tokenizer
         self.max_len = max_len
+
+    @staticmethod
+    def _bucket_up(value: int, buckets: tuple[int, ...]) -> int:
+        """Округляет вверх до ближайшего бакета (последний бакет — потолок)."""
+        for b in buckets:
+            if value <= b:
+                return b
+        return buckets[-1]
 
     def __call__(
         self, batch: list[tuple[torch.Tensor, str]],
@@ -180,17 +197,22 @@ class CollateFunction:
         """Возвращает (images, src_key_padding_mask, tgt_ids).
 
         - images: [B, 1, max_h, max_w] — паддинг справа значением 1.0 (белый).
+          max_w округлён вверх до WIDTH_BUCKETS для стабильности torch.compile.
         - src_key_padding_mask: [B, max_w] — True там, где пиксельный паддинг
           (нужно энкодеру, чтобы cross-attn декодера не attend'ил к шуму).
           Маска по высоте не делается: после CNN высота схлопывается в 1
           через AdaptiveAvgPool2d, поэтому вертикальный паддинг безвреден.
         - tgt_ids: [B, real_max_len] — токены с PAD'ами в конце.
+          real_max_len округлён вверх до TGT_BUCKETS.
         """
         max_h = max(img.shape[1] for img, _ in batch)
-        max_w = max(img.shape[2] for img, _ in batch)
+        natural_w = max(img.shape[2] for img, _ in batch)
+        max_w = self._bucket_up(natural_w, self.WIDTH_BUCKETS)
 
         batch_max_tok = max(len(self.tokenizer.tokenize(f)) for _, f in batch)
-        real_max_len = min(self.max_len, batch_max_tok + 2)
+        natural_len = min(self.max_len, batch_max_tok + 2)
+        real_max_len = min(self.max_len,
+                           self._bucket_up(natural_len, self.TGT_BUCKETS))
 
         B = len(batch)
         src_kpm = torch.zeros(B, max_w, dtype=torch.bool)
