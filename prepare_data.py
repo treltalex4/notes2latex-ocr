@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import sys
+from multiprocessing import Pool, cpu_count
 
 import numpy as np
 from tqdm import tqdm
@@ -116,6 +117,45 @@ def _print_stats(name: str, manifest: list[dict], skipped: list[str]) -> None:
           f"max={widths.max()}")
 
 
+def _process_sample(args: tuple) -> dict:
+    sample, dataset_name, cache_subdir, target_height, max_width, tokenizer_max_len = args
+    raw_path = sample["image_path"]
+    formula  = sample["formula"]
+    split    = sample.get("split", "train")
+
+    img = load_image(raw_path)
+    if img is None:
+        return {"status": "skip", "reason": f"broken_file\t{raw_path}"}
+
+    img = crop_to_content(img)
+
+    max_aspect = 80 if dataset_name == "handwritten" else 30
+    h0, w0 = img.shape
+    if h0 == 0 or w0 / max(h0, 1) > max_aspect:
+        return {"status": "skip", "reason": f"bad_aspect_ratio\tw={w0} h={h0}\t{raw_path}"}
+
+    img = resize_preserve_aspect(img, target_height, max_width)
+
+    token_len = len(LaTeXTokenizer.tokenize(formula))
+    if token_len > tokenizer_max_len:
+        return {"status": "skip", "reason": f"formula_too_long\tlen={token_len}\t{raw_path}"}
+
+    npy_path = os.path.join(cache_subdir, _stable_hash(raw_path) + ".npy")
+    np.save(npy_path, img)
+
+    _, w = img.shape
+    return {
+        "status": "ok",
+        "entry": {
+            "npy_path": npy_path,
+            "formula":  formula,
+            "length":   token_len,
+            "width":    w,
+            "split":    split,
+        },
+    }
+
+
 def prepare_dataset(
     config: Config,
     dataset_name: str,
@@ -174,55 +214,29 @@ def prepare_dataset(
         print(f"  [{dataset_name}] --limit: {len(sampled)}/{len(raw_samples)} сэмплов")
         raw_samples = sampled
 
+    num_workers = min(config.num_workers, cpu_count())
     print(f"\n[{dataset_name}] обработка {len(raw_samples)} изображений "
-          f"(target_h={config.target_height}, max_w={config.max_width})...")
+          f"(target_h={config.target_height}, max_w={config.max_width}, "
+          f"workers={num_workers})...")
 
     manifest: list[dict] = []
     skipped:  list[str]  = []
 
-    for sample in tqdm(raw_samples, unit="img"):
-        raw_path = sample["image_path"]
-        formula  = sample["formula"]
-        split    = sample.get("split", "train")
+    worker_args = [
+        (sample, dataset_name, cache_subdir, config.target_height,
+         config.max_width, config.tokenizer_max_len)
+        for sample in raw_samples
+    ]
 
-        img = load_image(raw_path)
-        if img is None:
-            skipped.append(f"broken_file\t{raw_path}")
-            continue
-
-        img = crop_to_content(img)
-
-        # Проверяем исходное соотношение сторон ДО resize (чтобы отловить
-        # патологически вытянутые изображения: однопиксельные строки и т.п.).
-        # Для handwritten порог выше, потому что строки реальных конспектов
-        # после слайсера имеют отношение w/h до ~50 (длинная формула во всю A4).
-        max_aspect = 80 if dataset_name == "handwritten" else 30
-        h0, w0 = img.shape
-        if h0 == 0 or w0 / max(h0, 1) > max_aspect:
-            skipped.append(f"bad_aspect_ratio\tw={w0} h={h0}\t{raw_path}")
-            continue
-
-        img = resize_preserve_aspect(img, config.target_height, config.max_width)
-        # NB: binarize намеренно убран — храним grayscale uint8. Грид и шум
-        # обрабатываются через augmentations на тренировке, не через threshold.
-
-        # Длина формулы в токенах
-        token_len = len(LaTeXTokenizer.tokenize(formula))
-        if token_len > config.tokenizer_max_len:
-            skipped.append(f"formula_too_long\tlen={token_len}\t{raw_path}")
-            continue
-
-        npy_path = os.path.join(cache_subdir, _stable_hash(raw_path) + ".npy")
-        np.save(npy_path, img)
-
-        _, w = img.shape
-        manifest.append({
-            "npy_path": npy_path,
-            "formula":  formula,
-            "length":   token_len,
-            "width":    w,
-            "split":    split,
-        })
+    with Pool(processes=num_workers) as pool:
+        for result in tqdm(
+            pool.imap_unordered(_process_sample, worker_args, chunksize=64),
+            total=len(raw_samples), unit="img"
+        ):
+            if result["status"] == "ok":
+                manifest.append(result["entry"])
+            else:
+                skipped.append(result["reason"])
 
     # Сохранить manifest
     with open(manifest_path, "w", encoding="utf-8") as f:
