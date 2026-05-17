@@ -72,19 +72,23 @@ def _compile_model(model, config):
     """Обёртка torch.compile с тройной защитой от recompile-thrash.
 
     Защиты (см. соответствующие места):
-    1. mark_dynamic в Notes2LaTeX.forward — dynamo должен сделать один
-       graph для всех форм (model/model.py).
+    1. mark_dynamic в _mark_dynamic_inputs — dynamo должен сделать один
+       graph для всех форм (train.py: train_one_epoch, validate, greedy_decode).
     2. enable_nested_tensor=False в TransformerEncoder — обход бага PyTorch
        (issue #163640) где TransformerEncoder fast path с bool маской
        несовместим с compile (model/encoder.py).
     3. Bucket-padding в CollateFunction — ограничивает число уникальных форм
-       до WIDTH_BUCKETS × TGT_BUCKETS = 8 × 7 = 56 worst case. Если
-       mark_dynamic не сработает из-за бага PT (#172822 - LayerNorm backward
-       специализирует batch dim), мы упёрлись в фиксированный потолок
-       рекомпиляций, а не в зацикливание (data/dataset.py).
+       до WIDTH_BUCKETS × TGT_BUCKETS = 8 × 7 = 56 worst case (data/dataset.py).
 
-    cache_size_limit=128 — с запасом покрывает 56 worst case + ветки SDPA
-    (с/без маски, с/без kv_cache в декодере).
+    Дополнительно: encoder компилируется ОТДЕЛЬНО и сохраняется как атрибут
+    `_encoder_for_decode` на compiled-объекте. Используется в greedy_decode_batch,
+    т.к. он вызывает model.encoder() напрямую — это обращение проходит мимо
+    основной compile-обёртки и без отдельной компиляции encoder работал бы
+    в eager-режиме. Decoder.forward_step не компилируется: его kv_cache
+    растёт по шагам (dynamic ad infinitum), это требует переписи на static
+    cache, что вне scope этой оптимизации.
+
+    cache_size_limit=128 — с запасом покрывает 56 worst case + ветки SDPA.
     """
     import torch._dynamo
     torch._dynamo.config.cache_size_limit = 128
@@ -92,8 +96,15 @@ def _compile_model(model, config):
         print(f"WARNING: use_compile=True на Windows — Triton поддерживается плохо, "
               f"возможны падения или отсутствие ускорения. Рекомендуется False.")
     print(f"torch.compile: mode={config.compile_mode} cache_size_limit=128 "
-          f"(mark_dynamic + bucket-padding — рекомпиляций должно быть мало)")
-    return torch.compile(model, mode=config.compile_mode)
+          f"(mark_dynamic + bucket-padding)")
+    compiled = torch.compile(model, mode=config.compile_mode)
+    # Отдельный компилированный encoder для greedy_decode (validate EM).
+    # model.encoder через OptimizedModule.__getattr__ возвращает оригинал —
+    # компилируя его повторно, мы получаем independent compile-artifact,
+    # который не интерферирует с inline-encoder'ом в основном graph модели.
+    compiled._encoder_for_decode = torch.compile(model.encoder, mode=config.compile_mode)
+    print(f"  + encoder скомпилирован отдельно для greedy_decode_batch")
+    return compiled
 
 
 def _make_checkpoint(stage, stage_name, epoch, model, optimizer, scheduler, scaler,
@@ -195,10 +206,23 @@ def greedy_decode_batch(model, images, src_kpm, tokenizer, device, max_len=600):
 
     O(T) по compute и памяти на шаг вместо O(T²) — каждый шаг считает Q только
     для нового токена, K/V для предыдущих позиций берутся из кэша.
+
+    encoder используется через _encoder_for_decode (отдельно скомпилирован
+    в _compile_model) если доступен, иначе fallback на eager. Decoder.forward_step
+    всегда в eager — растущий kv_cache требует static-cache переписи.
     """
     model.eval()
     B = images.shape[0]
-    memory, memory_kpm = model.encoder(images, src_key_padding_mask=src_kpm)
+
+    # Encoder: skомпилированный если есть, иначе оригинал (через unwrap).
+    encoder = getattr(model, "_encoder_for_decode", None)
+    if encoder is None:
+        encoder = _unwrap_compiled(model).encoder
+    # mark_dynamic на W ДО вызова — нужно для одной компиляции на все ширины батча.
+    torch._dynamo.maybe_mark_dynamic(images, 3)
+    if src_kpm is not None:
+        torch._dynamo.maybe_mark_dynamic(src_kpm, 1)
+    memory, memory_kpm = encoder(images, src_key_padding_mask=src_kpm)
 
     # Первый шаг: пропускаем SOS через декодер, инициализируем кэш.
     cur_token = torch.full((B, 1), SOS_ID, dtype=torch.long, device=device)
@@ -667,6 +691,10 @@ def main():
 
     # для слабого железа
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--val-batch-size", type=int, default=None,
+                        help="override config.val_batch_size. Без градиентов "
+                             "помещается в 2-3× train-batch, ускоряет EM (greedy decode). "
+                             "На rtx5090_32gb дефолт 96.")
     parser.add_argument("--grad-accum-steps", type=int, default=None,
                         help="override config.grad_accum_steps. "
                              "Effective batch = batch_size * grad_accum_steps.")
@@ -678,6 +706,8 @@ def main():
     overrides = {}
     if args.batch_size is not None:
         overrides["batch_size"] = args.batch_size
+    if args.val_batch_size is not None:
+        overrides["val_batch_size"] = args.val_batch_size
     if args.grad_accum_steps is not None:
         overrides["grad_accum_steps"] = args.grad_accum_steps
     if args.num_workers is not None:

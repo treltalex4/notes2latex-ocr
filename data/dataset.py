@@ -324,6 +324,7 @@ def build_multi_dataloaders(
     """
     collate_fn = CollateFunction(tokenizer, max_len=config.tokenizer_max_len)
     kw = _make_loader_kwargs(config, collate_fn)
+    val_bs = config.val_batch_size or config.batch_size
 
     if stage == 1:
         train_ds = Im2LatexDataset(config.cache_dir, split="train", max_length=config.tokenizer_max_len)
@@ -334,8 +335,8 @@ def build_multi_dataloaders(
         _apply_elastic_factor(config, test_ds,  is_train=False)
 
         train_loader = DataLoader(train_ds, batch_sampler=BucketBatchSampler(train_ds, config.batch_size, shuffle=True),  **kw)
-        val_loader   = DataLoader(val_ds,   batch_sampler=BucketBatchSampler(val_ds,   config.batch_size, shuffle=False), **kw)
-        test_loader  = DataLoader(test_ds,  batch_sampler=BucketBatchSampler(test_ds,  config.batch_size, shuffle=False), **kw)
+        val_loader   = DataLoader(val_ds,   batch_sampler=BucketBatchSampler(val_ds,   val_bs, shuffle=False), **kw)
+        test_loader  = DataLoader(test_ds,  batch_sampler=BucketBatchSampler(test_ds,  val_bs, shuffle=False), **kw)
         return train_loader, val_loader, test_loader
 
     if stage == 2:
@@ -353,7 +354,7 @@ def build_multi_dataloaders(
 
         train_loader = DataLoader(combined, sampler=sampler, batch_size=config.batch_size,
                                   drop_last=True, **kw)
-        val_loader   = DataLoader(val_ds, batch_sampler=BucketBatchSampler(val_ds, config.batch_size, shuffle=False), **kw)
+        val_loader   = DataLoader(val_ds, batch_sampler=BucketBatchSampler(val_ds, val_bs, shuffle=False), **kw)
         return train_loader, val_loader, None
 
     if stage == 3:
@@ -374,7 +375,7 @@ def build_multi_dataloaders(
 
         train_loader = DataLoader(combined, sampler=sampler, batch_size=config.batch_size,
                                   drop_last=True, **kw)
-        val_loader   = DataLoader(hw_val_ds, batch_sampler=BucketBatchSampler(hw_val_ds, config.batch_size, shuffle=False), **kw)
+        val_loader   = DataLoader(hw_val_ds, batch_sampler=BucketBatchSampler(hw_val_ds, val_bs, shuffle=False), **kw)
         return train_loader, val_loader, None
 
     raise ValueError(f"stage должен быть 1, 2 или 3, получено: {stage}")

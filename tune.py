@@ -442,6 +442,9 @@ def main():
 
     # Standard overrides (как в train.py)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--val-batch-size", type=int, default=None,
+                        help="override config.val_batch_size. Ускоряет EM (greedy decode) "
+                             "в конце эпохи. 2-3× train-batch обычно безопасно (нет градиентов).")
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-width", type=int, default=None)
     parser.add_argument("--use-compile", action=argparse.BooleanOptionalAction, default=None,
@@ -453,7 +456,8 @@ def main():
     _set_seed(args.seed)
 
     base_overrides: dict = {}
-    if args.batch_size is not None:  base_overrides["batch_size"]  = args.batch_size
+    if args.batch_size is not None:      base_overrides["batch_size"]     = args.batch_size
+    if args.val_batch_size is not None:  base_overrides["val_batch_size"] = args.val_batch_size
     if args.num_workers is not None: base_overrides["num_workers"] = args.num_workers
     if args.max_width is not None:   base_overrides["max_width"]   = args.max_width
     if args.use_compile is not None: base_overrides["use_compile"] = args.use_compile

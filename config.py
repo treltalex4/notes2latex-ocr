@@ -24,6 +24,9 @@ class Config:
 
     # ===== Training =====
     batch_size: int = 12            # снижено с 16 → запас VRAM на широкие картинки
+    val_batch_size: int = 24        # 2× batch_size: на validate'е нет градиентов,
+                                    # больший батч ускоряет EM (greedy decode) ~2×.
+                                    # На rtx5090_32gb переопределяется в профиле = 96.
     grad_accum_steps: int = 2       # effective bs = 24 (lr=1e-3 валидирован при bs=32, разница 25% — терпимо)
     grad_clip_norm: float = 0.85
     learning_rate: float = 3.7e-4
@@ -217,6 +220,7 @@ _PROFILES: dict[str, dict[str, Any]] = {
         "dim_feedforward": 2048,
         "max_seq_len": 1024,
         "batch_size": 32,
+        "val_batch_size": 96,           # 3× train: ускоряет EM (greedy decode) ~2×
         "grad_accum_steps": 2,          # effective bs = 64
         "num_workers": 14,              # 16 vCPU выделенного сервера: 14 воркеров + 2 для main/sys
         "amp_dtype": "bfloat16",
