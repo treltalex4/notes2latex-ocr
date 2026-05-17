@@ -161,6 +161,7 @@ def prepare_dataset(
     dataset_name: str,
     force: bool = False,
     limit: int | None = None,
+    num_workers: int | None = None,
 ) -> None:
     cache_subdir  = os.path.join(config.cache_dir, dataset_name)
     manifest_path = os.path.join(cache_subdir, "manifest.json")
@@ -214,7 +215,7 @@ def prepare_dataset(
         print(f"  [{dataset_name}] --limit: {len(sampled)}/{len(raw_samples)} сэмплов")
         raw_samples = sampled
 
-    num_workers = min(config.num_workers, cpu_count())
+    num_workers = num_workers or min(config.num_workers * 2, cpu_count())
     print(f"\n[{dataset_name}] обработка {len(raw_samples)} изображений "
           f"(target_h={config.target_height}, max_w={config.max_width}, "
           f"workers={num_workers})...")
@@ -305,6 +306,10 @@ def main() -> None:
         choices=["rtx4060_8gb", "rtx5090_32gb"],
         help="GPU-профиль конфига",
     )
+    parser.add_argument(
+        "--num-workers", type=int, default=None,
+        help="Число параллельных воркеров (по умолчанию: min(num_workers*2, cpu_count))",
+    )
     args = parser.parse_args()
 
     config = load_config(args.profile)
@@ -314,7 +319,8 @@ def main() -> None:
     print(f"Кэш: {os.path.abspath(config.cache_dir)}\n")
 
     for ds_name in args.datasets:
-        prepare_dataset(config, ds_name, force=args.force, limit=args.limit)
+        prepare_dataset(config, ds_name, force=args.force, limit=args.limit,
+                        num_workers=args.num_workers)
 
     print("\nГотово.")
 
