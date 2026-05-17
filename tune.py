@@ -443,6 +443,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--max-width", type=int, default=None)
+    parser.add_argument("--use-compile", action=argparse.BooleanOptionalAction, default=False,
+                        help="torch.compile внутри трейлов. Дефолт False: dynamic shapes "
+                             "BucketBatchSampler конфликтуют с Inductor lowering "
+                             "adaptive_avg_pool2d. Для tune compile не нужен (важна "
+                             "сравнимость трейлов, не максимум throughput).")
 
     args = parser.parse_args()
 
@@ -452,6 +457,7 @@ def main():
     if args.batch_size is not None:  base_overrides["batch_size"]  = args.batch_size
     if args.num_workers is not None: base_overrides["num_workers"] = args.num_workers
     if args.max_width is not None:   base_overrides["max_width"]   = args.max_width
+    if args.use_compile is not None: base_overrides["use_compile"] = args.use_compile
 
     # Девайс и токенайзер строятся один раз — переиспользуются между трейлами.
     probe = load_config(args.profile, **base_overrides)
