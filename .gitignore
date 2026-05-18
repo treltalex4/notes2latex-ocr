@@ -47,3 +47,6 @@ yolo26n.pt
 
 # Optuna Database
 optuna.db
+
+# RunPod
+server/
