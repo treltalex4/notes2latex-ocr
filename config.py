@@ -39,7 +39,11 @@ class Config:
     warmup_steps: int = 12000
     patience: int = 8               # early stopping (20% от epochs_pretrain)
     seed: int = 42                  # фиксированный seed (None = random)
-    n_em_batches: int = 150          # сколько val-батчей идёт в EM-метрику
+    n_em_batches: int = 20           # сколько val-батчей идёт в EM-метрику.
+                                     # При val_batch_size=96 это ~1920 примеров,
+                                     # достаточно для стабильной оценки EM.
+                                     # Если меняешь val_batch_size — пересчитай так,
+                                     # чтобы n_em_batches × val_batch_size ≈ 1500-2000.
 
     
 

@@ -413,10 +413,12 @@ def main():
                              "20 даёт чуть больше хвоста на max_length=350.")
     parser.add_argument("--schedule-epochs", type=int, default=40,
                         help="Горизонт LR-scheduler в эпохах")
-    parser.add_argument("--n-em-batches", type=int, default=60,
+    parser.add_argument("--n-em-batches", type=int, default=16,
                         help="Сколько val-батчей идёт в EM-метрику внутри трейла. "
-                             "60 (~720 примеров) даёт уверенный EM-сигнал на 18-эпохных "
-                             "трейлах. На RTX 5090 с compile оверхед минимален.")
+                             "При val_batch_size=96 это ~1536 примеров — достаточно "
+                             "для устойчивой оценки EM. Раньше было 60 при val_batch=24 "
+                             "(те же 1440 примеров). Если увеличиваешь val_batch_size — "
+                             "уменьшай n_em_batches пропорционально.")
     parser.add_argument("--limit-batches", type=int, default=None,
                         help="Ограничить train-батчи (только для smoke-тестов). "
                              "По умолчанию — полный датасет.")
