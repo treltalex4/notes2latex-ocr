@@ -56,7 +56,7 @@ from data.tokenizer import LaTeXTokenizer, PAD_ID
 from model.model import Notes2LaTeX, count_parameters
 from train import (
     apply_curriculum, make_lr_scheduler, train_one_epoch, validate,
-    _compile_model,
+    _compile_model, _unwrap_compiled,
 )
 
 
@@ -322,9 +322,105 @@ def make_objective(args, base_overrides: dict, tokenizer: LaTeXTokenizer, device
         trial.set_user_attr("rebound_val",    round(_rebound(val_losses), 4))
         trial.set_user_attr("rebound_train",  round(_rebound(train_losses), 4))
 
+        # Сохраняем полный resume-снимок: cleanup до top-K в callback после
+        # того как trial.value попадёт в study (см. _prune_to_top_k в main).
+        if args.save_topk_checkpoints:
+            ckpt_path = _save_trial_checkpoint(
+                trial, model, optimizer, scheduler, scaler,
+                epoch=args.epochs - 1,
+                val_loss=val_losses[-1], val_acc=val_accs[-1], val_em=val_ems[-1],
+                vocab_size=tokenizer.vocab_size,
+                best_val_loss=min(val_losses),
+                ckpt_dir=args.tune_ckpt_dir,
+            )
+            trial.set_user_attr("checkpoint_path", ckpt_path)
+
         return _compute_objective(metric_name, train_losses, val_losses, val_ems)
 
     return objective
+
+
+# ===== Top-K trial checkpoints =====
+# Сохраняем полный resume-снимок (model + optimizer + scheduler + scaler) для
+# top-K завершённых трейлов. После каждого трейла callback удаляет чекпоинты,
+# выпавшие из топа. Цель — дать возможность дотюнить top-1/2/3 в train.py
+# с эпохи N+1 до 40 (~22 доп. эпохи) без перезапуска с нуля.
+# Формат чекпоинта зеркалит train.py._make_checkpoint, чтобы train.py
+# --resume-from подхватил его как обычный last_*.pth.
+
+def _trial_ckpt_path(ckpt_dir: str, trial_number: int) -> str:
+    return os.path.join(ckpt_dir, f"trial_{trial_number}.pth")
+
+
+def _save_trial_checkpoint(trial, model, optimizer, scheduler, scaler,
+                           epoch: int, val_loss: float, val_acc: float,
+                           val_em: float, vocab_size: int,
+                           best_val_loss: float, ckpt_dir: str) -> str:
+    """Сохраняет полный resume-снимок трейла. Формат идентичен
+    train.py._make_checkpoint → train.py --resume-from подхватывает напрямую."""
+    os.makedirs(ckpt_dir, exist_ok=True)
+    path = _trial_ckpt_path(ckpt_dir, trial.number)
+    ckpt = {
+        "stage": 1,
+        "stage_name": "pretrain",
+        "epoch": epoch,
+        "interrupted": False,
+        "model_state_dict": _unwrap_compiled(model).state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "best_val_loss": best_val_loss,
+        "epochs_no_improve": 0,
+        "history_path": None,        # train.py создаст новый history при resume
+        "val_loss": val_loss,
+        "val_acc": val_acc,
+        "val_em": val_em,
+        "vocab_size": vocab_size,
+    }
+    torch.save(ckpt, path)
+    return path
+
+
+def _prune_to_top_k(study, ckpt_dir: str, k: int) -> None:
+    """Удаляет чекпоинты трейлов, выпавших из top-K по composite metric."""
+    if not os.path.isdir(ckpt_dir):
+        return
+    completed = [t for t in study.trials if t.state == TrialState.COMPLETE]
+    keep = {t.number for t in sorted(completed, key=lambda t: t.value)[:k]}
+    for fname in os.listdir(ckpt_dir):
+        if not (fname.startswith("trial_") and fname.endswith(".pth")):
+            continue
+        try:
+            num = int(fname[len("trial_"):-len(".pth")])
+        except ValueError:
+            continue
+        if num not in keep:
+            try:
+                os.remove(os.path.join(ckpt_dir, fname))
+            except OSError:
+                pass
+
+
+def _trial_resume_cmd(trial, profile: str, schedule_epochs: int,
+                      ckpt_path: str) -> str:
+    """Готовая команда для train.py --resume-from <чекпоинт>.
+
+    КРИТИЧНО: --epochs-stage1 ДОЛЖЕН равняться schedule_epochs из tune
+    (горизонт scheduler'а). Иначе cosine форма не совпадёт с той, что трейл
+    проигрывал, и LR/scheduler-state из чекпоинта окажутся в неверной точке.
+    """
+    p = trial.params
+    return (
+        f"python train.py --profile {profile}"
+        f" --resume-from {ckpt_path}"
+        f" --stages 1 --epochs-stage1 {schedule_epochs}"
+        f" --lr {p['learning_rate']:.6g}"
+        f" --weight-decay {p['weight_decay']:.6g}"
+        f" --dropout {p['dropout']:.4g}"
+        f" --label-smoothing {p['label_smoothing']:.4g}"
+        f" --warmup-steps {int(p['warmup_steps'])}"
+        f" --grad-clip-norm {p['grad_clip_norm']:.4g}"
+    )
 
 
 def _trial_to_dict(t) -> dict:
@@ -342,9 +438,21 @@ def _save_results(study: optuna.Study, args, output_path: str) -> None:
     pruned    = [t for t in study.trials if t.state == TrialState.PRUNED]
     failed    = [t for t in study.trials if t.state == TrialState.FAIL]
 
-    # top-5 среди завершённых
+    # top-5 среди завершённых. Первые args.topk обогащаются resume_cmd
+    # (для них на диске лежат чекпоинты — см. _save_trial_checkpoint в objective).
     completed_sorted = sorted(completed, key=lambda t: t.value)
-    top5 = [_trial_to_dict(t) for t in completed_sorted[:5]]
+    schedule_epochs = args.schedule_epochs or args.epochs
+    top5 = []
+    for rank, t in enumerate(completed_sorted[:5]):
+        d = _trial_to_dict(t)
+        if rank < args.topk and args.save_topk_checkpoints:
+            ckpt_path = _trial_ckpt_path(args.tune_ckpt_dir, t.number)
+            if os.path.exists(ckpt_path):
+                d["checkpoint_path"] = ckpt_path
+                d["resume_cmd"] = _trial_resume_cmd(
+                    t, args.profile, schedule_epochs, ckpt_path
+                )
+        top5.append(d)
 
     if completed:
         best = study.best_trial
@@ -401,10 +509,8 @@ def _save_results(study: optuna.Study, args, output_path: str) -> None:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", default="rtx4060_8gb")
-    parser.add_argument("--n-trials", type=int, default=100,
-                        help="Сколько трейлов. 6 dims в search → 100 для уверенной "
-                             "сходимости TPE и низкой вероятности что top-5 — везение. "
-                             "На RTX 5090 с compile ~60-70ч с pruning.")
+    parser.add_argument("--n-trials", type=int, default=50,
+                        help="Сколько трейлов.")
     parser.add_argument("--epochs", type=int, default=18,
                         help="Эпох в одном трейле. 18 эпох при schedule-epochs=40 "
                              "покрывают оба curriculum-перехода (200→280 на epoch 6, "
@@ -441,6 +547,18 @@ def main():
     parser.add_argument("--trial-log-every", type=int, default=1000,
                         help="Печатать step-лог внутри трейла раз в N батчей. "
                              "0 = отключить. По умолчанию 1000 (~7 строк/эпоху).")
+    parser.add_argument("--save-topk-checkpoints",
+                        action=argparse.BooleanOptionalAction, default=True,
+                        help="Сохранять полные resume-чекпоинты top-K завершённых "
+                             "трейлов. После каждого трейла callback удаляет "
+                             "выпавшие из топа. Готовая команда train.py --resume-from "
+                             "пишется в JSON (resume_cmd). Страховка против регресса "
+                             "top-1 на эпохах 19+ — можно дотюнить top-2/3 без "
+                             "перезапуска с нуля. Стоимость: ~150MB × K на диске.")
+    parser.add_argument("--topk", type=int, default=3,
+                        help="Сколько лучших трейлов хранить чекпоинтами (default 3).")
+    parser.add_argument("--tune-ckpt-dir", default="checkpoints/tune_topk",
+                        help="Папка для top-K trial чекпоинтов.")
 
     # Standard overrides (как в train.py)
     parser.add_argument("--batch-size", type=int, default=None)
@@ -491,9 +609,19 @@ def main():
 
     objective = make_objective(args, base_overrides, tokenizer, device)
 
+    # Callback после каждого трейла: удаляет чекпоинты не из top-K.
+    # objective сохраняет чекпоинт ДО return (trial.value ещё не в study),
+    # поэтому ротация делается тут — когда study уже знает результат трейла.
+    callbacks = None
+    if args.save_topk_checkpoints:
+        def _topk_cleanup(study, *_):  # optuna API: callback(study, trial)
+            _prune_to_top_k(study, args.tune_ckpt_dir, args.topk)
+        callbacks = [_topk_cleanup]
+
     try:
         study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout,
-                       gc_after_trial=True, show_progress_bar=False)
+                       gc_after_trial=True, show_progress_bar=False,
+                       callbacks=callbacks)
     except KeyboardInterrupt:
         print("\n[INTERRUPT] saving partial results...")
         _save_results(study, args, args.output)
