@@ -19,6 +19,8 @@ checkpoints/
 notebooks/data/
 data_synthetic/
 data_cache/
+unimer_download/
+new_dataset.md
 
 # Local testing and development
 test/
@@ -34,6 +36,8 @@ find_batch_size.py
 test_binarize.py
 test_grid_aug.py
 diag_sdpa.py
+final_eval_worst.json
+final_eval.json
 
 # YOLO Weights and training dataset
 yolo_training/weights
@@ -47,6 +51,7 @@ yolo26n.pt
 
 # Optuna Database
 optuna.db
+optuna_big.db
 
 # RunPod
 server/

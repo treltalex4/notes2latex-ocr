@@ -654,7 +654,7 @@ def main():
                         help="Override config.n_em_batches (20 по дефолту). "
                              "Сколько val-батчей идёт в EM (greedy decode).")
     parser.add_argument("--tokenizer", default="data_cache/tokenizer.json")
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--log-every", type=int, default=500)
     parser.add_argument("--warmup-steps", type=int, default=None,
                         help="override config.warmup_steps (useful for debug runs)")
     parser.add_argument("--grad-clip-norm", type=float, default=None,
