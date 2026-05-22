@@ -38,7 +38,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Build LaTeXTokenizer vocabulary.")
     parser.add_argument(
         "--datasets", nargs="+",
-        choices=["im2latex", "synthetic", "handwritten"],
+        choices=["im2latex", "synthetic", "handwritten", "unimer"],
         default=["im2latex", "synthetic"],
         help="Datasets to include in the vocabulary.",
     )

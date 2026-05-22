@@ -92,6 +92,32 @@ def _list_handwritten(config: Config) -> list[dict]:
     ]
 
 
+def _list_unimer(config: Config) -> list[dict]:
+    """data_raw/unimer/{images/, labels.json} → список raw-сэмплов.
+
+    labels.json в формате adapt_unimer.py:
+        {filename: {"formula": ..., "split": "train"/"validate"/"test", "source": ...}}
+    В отличие от synthetic (плоский {filename: latex}) — здесь split уже задан
+    адаптером (train/validate из UniMER-1M, test из UniMER-Test).
+    """
+    base = os.path.join(config.data_dir, "unimer")
+    labels_path = os.path.join(base, "labels.json")
+    if not os.path.exists(labels_path):
+        print(f"  [WARN] UniMER не найден: {labels_path}. Запусти adapt_unimer.py")
+        return []
+    with open(labels_path, encoding="utf-8") as f:
+        labels: dict[str, dict] = json.load(f)
+    images_dir = os.path.join(base, "images")
+    return [
+        {
+            "image_path": os.path.join(images_dir, fname),
+            "formula": entry["formula"],
+            "split": entry["split"],
+        }
+        for fname, entry in labels.items()
+    ]
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Core
 # ──────────────────────────────────────────────────────────────────────────────
@@ -190,6 +216,7 @@ def prepare_dataset(
         "im2latex":    _list_im2latex,
         "synthetic":   _list_synthetic,
         "handwritten": _list_handwritten,
+        "unimer":      _list_unimer,
     }
     if dataset_name not in _listers:
         raise ValueError(f"Неизвестный датасет: {dataset_name!r}")
@@ -287,10 +314,10 @@ def main() -> None:
     )
     parser.add_argument(
         "--datasets", nargs="+",
-        choices=["im2latex", "synthetic", "handwritten"],
+        choices=["im2latex", "synthetic", "handwritten", "unimer"],
         default=["im2latex"],
         metavar="DATASET",
-        help="Какие датасеты обработать (im2latex | synthetic | handwritten)",
+        help="Какие датасеты обработать (im2latex | synthetic | handwritten | unimer)",
     )
     parser.add_argument(
         "--force", action="store_true",

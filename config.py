@@ -13,7 +13,7 @@ class Config:
     num_encoder_layers: int = 4
     num_decoder_layers: int = 4
     dim_feedforward: int = 1024
-    dropout: float = 0.23
+    dropout: float = 0.235
     max_seq_len: int = 1024         # верхний предел для PE encoder'а (mem_len = max_width/4)
     use_rope: bool = True           # RoPE в декодере вместо learnable PE
 
@@ -24,22 +24,22 @@ class Config:
 
     # ===== Training =====
     batch_size: int = 12            # снижено с 16 → запас VRAM на широкие картинки
-    val_batch_size: int = 96        # потолок для greedy decode: выше throughput падает
+    val_batch_size: int = 24        # потолок для greedy decode: выше throughput падает
                                     # (kernel launch overhead растёт быстрее GPU utilization).
                                     # На validate'е нет градиентов, VRAM ~15% на 5090.
                                     # На ноуте при OOM — переопределить через --val-batch-size.
     grad_accum_steps: int = 2       # effective bs = 24 (lr=1e-3 валидирован при bs=32, разница 25% — терпимо)
-    grad_clip_norm: float = 0.85
-    learning_rate: float = 3.7e-4
-    weight_decay: float = 2.342e-3
-    label_smoothing: float = 0.002    # CE label smoothing; 0.05–0.1 — типично для seq2seq
+    grad_clip_norm: float = 0.46
+    learning_rate: float = 9.6e-05
+    weight_decay: float = 0.00052
+    label_smoothing: float = 0.00117    # CE label smoothing; 0.05–0.1 — типично для seq2seq
     epochs_pretrain: int = 40       # этап 1: формулы (im2latex)
     epochs_mixed: int = 40          # этап 2: формулы + синтетика
     epochs_finetune: int = 20       # этап 3: свой датасет (с replay synthetic)
     warmup_steps: int = 12000
     patience: int = 8               # early stopping (20% от epochs_pretrain)
     seed: int = 42                  # фиксированный seed (None = random)
-    n_em_batches: int = 20           # сколько val-батчей идёт в EM-метрику.
+    n_em_batches: int = 50           # сколько val-батчей идёт в EM-метрику.
                                      # При val_batch_size=96 это ~1920 примеров,
                                      # достаточно для стабильной оценки EM.
                                      # Если меняешь val_batch_size — пересчитай так,
@@ -57,13 +57,13 @@ class Config:
     # с mode="max-autotune" ещё +5-10% (но компиляция первого шага ~3-5 мин).
     # Чекпоинты сохраняются как "голые" веса (без _orig_mod префикса),
     # поэтому совместимы между compile=True и compile=False.
-    use_compile: bool = True
+    use_compile: bool = False
     compile_mode: str = "default"    # "default" | "reduce-overhead" | "max-autotune"
 
     # ===== Data Loading =====
     # num_workers: ставить ~= числу физических CPU/2 или vCPU/2.
     # 16 vCPU (Linux серверы) → 8. На Windows 6 (меньше из-за spawn overhead).
-    num_workers: int = 8
+    num_workers: int = 6
     prefetch_factor: int = 4
 
     # ===== Datasets =====
@@ -105,6 +105,9 @@ class Config:
     elastic_factor_im2latex: float = 0.4
     elastic_factor_synthetic: float = 1.0
     elastic_factor_handwritten: float = 0.0
+    # unimer: печатные формулы как im2latex → мягкий elastic (0.4), НЕ 1.0.
+    # Типографский рендер не должен сильно искажаться elastic'ом.
+    elastic_factor_unimer: float = 0.4
     augment_strength_max: float = 0.6       # верхний потолок не-elastic curriculum
 
     # Grid augmentation: имитация тетрадной клетки на чистых im2latex/synthetic.
@@ -114,6 +117,7 @@ class Config:
     grid_aug_factor_im2latex: float = 1.0
     grid_aug_factor_synthetic: float = 1.0
     grid_aug_factor_handwritten: float = 0.0
+    grid_aug_factor_unimer: float = 1.0    # как im2latex — клетка готовит к stage 3
     grid_cell_min: int = 20                 # min размер клетки в px
     grid_cell_max: int = 50                 # max размер клетки в px
     grid_intensity_min: int = 160           # min яркость линий сетки (text ~50, paper ~255)

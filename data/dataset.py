@@ -65,6 +65,23 @@ class Im2LatexDataset(_CachedDataset):
         self.max_length = max_length
 
 
+class UnimerDataset(_CachedDataset):
+    """UniMER-1M (печатные формулы). Заменяет im2latex в роли stage-1 pretrain.
+
+    Манифест содержит train/validate/test splits (заданы adapt_unimer.py:
+    train/validate из UniMER-1M, test из UniMER-Test). Структура идентична
+    Im2LatexDataset — единственное отличие dataset_type для per-dataset
+    augmentation факторов.
+    """
+    dataset_type = "unimer"
+
+    def __init__(self, cache_dir: str, split: str = "train", max_length: int = 512) -> None:
+        entries = _load_manifest(cache_dir, "unimer")
+        entries = [e for e in entries if e.get("split", "train") == split]
+        super().__init__(entries)
+        self.max_length = max_length
+
+
 class SyntheticDataset(_CachedDataset):
     dataset_type = "synthetic"
 
@@ -255,11 +272,13 @@ def _apply_dataset_factors(config: Config, dataset: "_CachedDataset", is_train: 
         "im2latex":    config.elastic_factor_im2latex,
         "synthetic":   config.elastic_factor_synthetic,
         "handwritten": config.elastic_factor_handwritten,
+        "unimer":      config.elastic_factor_unimer,
     }
     grid_map = {
         "im2latex":    config.grid_aug_factor_im2latex,
         "synthetic":   config.grid_aug_factor_synthetic,
         "handwritten": config.grid_aug_factor_handwritten,
+        "unimer":      config.grid_aug_factor_unimer,
     }
     dataset.elastic_factor = elastic_map.get(dataset.dataset_type, 1.0)
     dataset.grid_aug_factor = grid_map.get(dataset.dataset_type, 1.0)
@@ -310,13 +329,22 @@ def _make_loader_kwargs(config: Config, collate_fn: CollateFunction) -> dict:
     return kwargs
 
 
+# Доступные датасеты для stage 1 (печатный pretrain). Класс выбирается по
+# config.datasets_stage1[0] — переключение на UniMER = одна строка в config.
+_STAGE1_DATASETS: dict[str, type[_CachedDataset]] = {
+    "im2latex": Im2LatexDataset,
+    "unimer":   UnimerDataset,
+}
+
+
 def build_multi_dataloaders(
     config: Config,
     tokenizer: LaTeXTokenizer,
     stage: int,
 ) -> tuple[DataLoader, DataLoader, DataLoader | None]:
     """
-    stage=1: im2latex only (pretrain). BucketBatchSampler + length curriculum.
+    stage=1: один печатный датасет (im2latex ИЛИ unimer — см. config.datasets_stage1).
+             BucketBatchSampler + length curriculum.
     stage=2: im2latex + synthetic. WeightedRandomSampler, val on im2latex validate split.
     stage=3: handwritten + synthetic replay. WeightedRandomSampler, val on handwritten val split.
 
@@ -327,9 +355,18 @@ def build_multi_dataloaders(
     val_bs = config.val_batch_size or config.batch_size
 
     if stage == 1:
-        train_ds = Im2LatexDataset(config.cache_dir, split="train", max_length=config.tokenizer_max_len)
-        val_ds   = Im2LatexDataset(config.cache_dir, split="validate")
-        test_ds  = Im2LatexDataset(config.cache_dir, split="test")
+        # Датасет stage 1 выбирается по config.datasets_stage1[0].
+        # Дефолт ["im2latex"]; для миграции на UniMER → ["unimer"].
+        ds_name = config.datasets_stage1[0]
+        dataset_cls = _STAGE1_DATASETS.get(ds_name)
+        if dataset_cls is None:
+            raise ValueError(
+                f"datasets_stage1[0]={ds_name!r} не поддержан для stage 1. "
+                f"Доступно: {list(_STAGE1_DATASETS)}"
+            )
+        train_ds = dataset_cls(config.cache_dir, split="train", max_length=config.tokenizer_max_len)
+        val_ds   = dataset_cls(config.cache_dir, split="validate")
+        test_ds  = dataset_cls(config.cache_dir, split="test")
         _apply_elastic_factor(config, train_ds, is_train=True)
         _apply_elastic_factor(config, val_ds,   is_train=False)
         _apply_elastic_factor(config, test_ds,  is_train=False)
